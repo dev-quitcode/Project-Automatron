@@ -1,4 +1,4 @@
-"""LangGraph State schema for the Automatron orchestrator."""
+"""LangGraph state schema for the Automatron orchestrator."""
 
 from __future__ import annotations
 
@@ -8,53 +8,101 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
-# Phase literals
-Phase = Literal["PLANNING", "SCAFFOLDING", "EXECUTING", "FROZEN", "COMPLETED"]
+ProjectStage = Literal[
+    "intake",
+    "planning",
+    "awaiting_plan_approval",
+    "repo_preparing",
+    "scaffolding",
+    "building",
+    "awaiting_preview_approval",
+    "ready_for_deploy",
+    "deploying",
+    "deployed",
+    "frozen",
+    "error",
+]
 
-# Builder status literals
+ProjectStatus = Literal[
+    "pending",
+    "planning",
+    "building",
+    "preview",
+    "ready_for_deploy",
+    "deploying",
+    "deployed",
+    "paused",
+    "frozen",
+    "error",
+]
+
 BuilderStatus = Literal["SUCCESS", "BLOCKER", "AMBIGUITY", "SILENT_DECISION", ""]
 
 
-class AutomatronState(TypedDict):
-    """Global state for the Automatron LangGraph state machine.
+class DeployTarget(TypedDict, total=False):
+    host: str
+    port: int
+    user: str
+    deploy_path: str
+    auth_reference: str
+    ssh_private_key: str
+    known_hosts: str
+    env_content: str
+    app_url: str
+    health_path: str
 
-    This TypedDict is the single source of truth for the entire orchestration
-    pipeline. Every node reads from and writes to this state.
-    """
 
-    # ── Project metadata ────────────────────────────────────────────────
+class AutomatronState(TypedDict, total=False):
     project_id: str
     project_name: str
+    intake_text: str
+    intake_source: str
+    source_ref: str
+    session_id: str
 
-    # ── PLAN.md content ─────────────────────────────────────────────────
-    plan_md: str  # Raw PLAN.md content (frontmatter + body)
-    stack_config: dict  # Parsed STACK_CONFIG.json
+    plan_md: str
+    stack_config: dict
 
-    # ── Current execution ───────────────────────────────────────────────
-    current_task_index: int  # Index of current [ ] task
-    current_task_text: str  # Full text of current task (title + context)
+    current_task_index: int
+    current_task_text: str
     total_tasks: int
     completed_tasks: int
 
-    # ── Messages (Architect chat history) ───────────────────────────────
     messages: Annotated[list[AnyMessage], add_messages]
 
-    # ── Builder output ──────────────────────────────────────────────────
-    builder_status: BuilderStatus  # SUCCESS | BLOCKER | AMBIGUITY | SILENT_DECISION
-    builder_output: str  # stdout/stderr from Cline
-    builder_error_detail: str  # Error description for escalation
+    builder_status: BuilderStatus
+    builder_output: str
+    builder_error_detail: str
+    builder_exit_code: int
+    builder_duration_s: float
+    architect_prompt_version: str
 
-    # ── Anti-loop tracking ──────────────────────────────────────────────
-    escalation_count: int  # Per-task escalation counter
-    escalation_history: list[dict]  # [{task_index, status, timestamp}]
+    escalation_count: int
+    escalation_history: list[dict]
 
-    # ── Docker ──────────────────────────────────────────────────────────
     container_id: str
     container_port: int
 
-    # ── Phase tracking ──────────────────────────────────────────────────
-    phase: Phase
+    repo_name: str
+    repo_url: str
+    repo_clone_url: str
+    default_branch: str
+    develop_branch: str
+    feature_branch: str
+    repo_ready: bool
 
-    # ── Human intervention ──────────────────────────────────────────────
+    preview_url: str
+    preview_status: str
+    preview_metadata: dict
+
+    deploy_target: DeployTarget
+
+    project_stage: ProjectStage
+    status: ProjectStatus
+
     requires_human: bool
     human_intervention_reason: str
+    plan_approved: bool
+    preview_approved: bool
+    plan_approved_at: str
+    preview_approved_at: str

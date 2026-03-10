@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 import tarfile
+from pathlib import Path
 from dataclasses import dataclass
 
 import docker
@@ -64,7 +65,8 @@ class ContainerManager:
             raise RuntimeError("Docker client not available")
 
         container_name = f"automatron-{project_id[:8]}"
-        workspace_path = f"{settings.workspace_base_path}/{project_id}"
+        workspace_path = Path(settings.workspace_base_path) / project_id
+        workspace_path.mkdir(parents=True, exist_ok=True)
         image = settings.golden_image
         internal_port = stack_config.get("port", 3000)
 
@@ -101,7 +103,7 @@ class ContainerManager:
                 environment=environment,
                 ports={f"{internal_port}/tcp": port},
                 volumes={
-                    workspace_path: {"bind": "/workspace", "mode": "rw"},
+                    str(workspace_path): {"bind": "/workspace", "mode": "rw"},
                 },
                 mem_limit="2g",
                 cpu_period=100000,
@@ -272,3 +274,89 @@ class ContainerManager:
                 f"Failed to read {container_path}: {result.output}"
             )
         return result.output
+
+    async def start_preview_process(
+        self,
+        container_id: str,
+        *,
+        internal_port: int,
+        external_port: int,
+        stack_config: dict,
+        workspace_path: Path,
+    ) -> None:
+        command = self._infer_preview_command(
+            internal_port=internal_port,
+            stack_config=stack_config,
+            workspace_path=workspace_path,
+        )
+        wrapped_command = (
+            "if [ -f /tmp/automatron-preview.pid ]; then "
+            "kill $(cat /tmp/automatron-preview.pid) >/dev/null 2>&1 || true; "
+            "fi; "
+            f"nohup bash -lc {self._quote_for_bash(command)} "
+            "> /tmp/automatron-preview.log 2>&1 & echo $! > /tmp/automatron-preview.pid"
+        )
+        await self.exec_in_container(container_id, wrapped_command, timeout=20)
+        logger.info(
+            "Started preview process for %s on %d (host %d)",
+            container_id[:12],
+            internal_port,
+            external_port,
+        )
+
+    async def wait_for_preview(
+        self,
+        container_id: str,
+        *,
+        internal_port: int,
+        attempts: int = 20,
+        delay_seconds: int = 2,
+    ) -> None:
+        check_command = (
+            f"for i in $(seq 1 {attempts}); do "
+            f"curl -fsS http://127.0.0.1:{internal_port}/ >/dev/null && exit 0; "
+            f"sleep {delay_seconds}; "
+            "done; "
+            "echo 'Preview server failed to respond'; "
+            "exit 1"
+        )
+        result = await self.exec_in_container(container_id, check_command, timeout=attempts * delay_seconds + 10)
+        if result.exit_code != 0:
+            raise RuntimeError(result.output)
+
+    def _infer_preview_command(
+        self,
+        *,
+        internal_port: int,
+        stack_config: dict,
+        workspace_path: Path,
+    ) -> str:
+        if (workspace_path / "next.config.js").exists() or (workspace_path / "next.config.ts").exists():
+            package_manager = "pnpm" if (workspace_path / "pnpm-lock.yaml").exists() else "npm"
+            install_cmd = "pnpm install" if package_manager == "pnpm" else "npm install"
+            dev_cmd = (
+                f"{package_manager} run dev -- --hostname 0.0.0.0 --port {internal_port}"
+                if package_manager == "pnpm"
+                else f"npm run dev -- --hostname 0.0.0.0 --port {internal_port}"
+            )
+            return f"{install_cmd} && {dev_cmd}"
+
+        if (workspace_path / "vite.config.ts").exists() or (workspace_path / "vite.config.js").exists():
+            package_manager = "pnpm" if (workspace_path / "pnpm-lock.yaml").exists() else "npm"
+            install_cmd = "pnpm install" if package_manager == "pnpm" else "npm install"
+            dev_cmd = (
+                f"{package_manager} run dev -- --host 0.0.0.0 --port {internal_port}"
+                if package_manager == "pnpm"
+                else f"npm run dev -- --host 0.0.0.0 --port {internal_port}"
+            )
+            return f"{install_cmd} && {dev_cmd}"
+
+        if (workspace_path / "pyproject.toml").exists() or (workspace_path / "requirements.txt").exists():
+            return f"python -m http.server {internal_port} --bind 0.0.0.0"
+
+        return f"python -m http.server {internal_port} --bind 0.0.0.0"
+
+    @staticmethod
+    def _quote_for_bash(command: str) -> str:
+        escaped = command.replace("\\", "\\\\").replace("\"", "\\\"")
+        return f'"{escaped}"'

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,10 +10,124 @@ from typing import Any
 
 import aiosqlite
 
+from orchestrator.config import settings
+
 logger = logging.getLogger(__name__)
 
-# Module-level DB path (set during init)
 _db_path: str = ""
+
+PROJECT_COLUMN_DEFS: dict[str, str] = {
+    "project_stage": "TEXT NOT NULL DEFAULT 'intake'",
+    "intake_text": "TEXT NOT NULL DEFAULT ''",
+    "intake_source": "TEXT NOT NULL DEFAULT 'manual'",
+    "source_ref": "TEXT",
+    "repo_name": "TEXT",
+    "repo_url": "TEXT",
+    "repo_clone_url": "TEXT",
+    "default_branch": "TEXT",
+    "develop_branch": "TEXT",
+    "feature_branch": "TEXT",
+    "repo_ready": "INTEGER NOT NULL DEFAULT 0",
+    "preview_url": "TEXT",
+    "preview_status": "TEXT NOT NULL DEFAULT 'pending'",
+    "preview_checked_at": "TEXT",
+    "preview_metadata_json": "TEXT",
+    "ci_status": "TEXT NOT NULL DEFAULT 'not_configured'",
+    "ci_run_id": "TEXT",
+    "ci_run_url": "TEXT",
+    "deploy_status": "TEXT NOT NULL DEFAULT 'not_configured'",
+    "deploy_run_url": "TEXT",
+    "deploy_commit_sha": "TEXT",
+    "deploy_target_json": "TEXT",
+    "github_environment_name": "TEXT NOT NULL DEFAULT 'production'",
+    "last_workflow_sync_at": "TEXT",
+    "plan_approved": "INTEGER NOT NULL DEFAULT 0",
+    "preview_approved": "INTEGER NOT NULL DEFAULT 0",
+    "plan_approved_at": "TEXT",
+    "preview_approved_at": "TEXT",
+    "approval_history_json": "TEXT",
+    "last_deploy_at": "TEXT",
+    "last_deploy_run_id": "TEXT",
+}
+
+JSON_FIELDS = {
+    "stack_config_json",
+    "deploy_target_json",
+    "preview_metadata_json",
+    "approval_history_json",
+}
+BOOL_FIELDS = {"repo_ready", "plan_approved", "preview_approved"}
+JSON_FIELD_DEFAULTS: dict[str, Any] = {
+    "stack_config_json": {},
+    "deploy_target_json": {},
+    "preview_metadata_json": {},
+    "approval_history_json": [],
+}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _json_loads(value: str | None, fallback: Any) -> Any:
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return fallback
+
+
+def _serialize_project_row(row: aiosqlite.Row) -> dict[str, Any]:
+    project = dict(row)
+
+    for field in JSON_FIELDS:
+        project[field] = _json_loads(project.get(field), JSON_FIELD_DEFAULTS[field])
+
+    for field in BOOL_FIELDS:
+        project[field] = bool(project.get(field))
+
+    deploy_target = project.get("deploy_target_json") or {}
+    project["deploy_target"] = deploy_target
+    project["deploy_target_summary"] = _summarize_deploy_target(deploy_target)
+    project["stack_config"] = project.get("stack_config_json") or {}
+    project["preview_metadata"] = project.get("preview_metadata_json") or {}
+    project["approval_history"] = project.get("approval_history_json") or []
+    project["description"] = project.get("intake_text", "")
+    project["preview_port"] = project.get("port")
+
+    return project
+
+
+def _summarize_deploy_target(target: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not target:
+        return None
+
+    return {
+        "host": target.get("host"),
+        "port": target.get("port", 22),
+        "user": target.get("user"),
+        "deploy_path": target.get("deploy_path"),
+        "auth_reference": target.get("auth_reference"),
+        "app_url": target.get("app_url"),
+        "health_path": target.get("health_path"),
+    }
+
+
+async def _ensure_columns(
+    db: aiosqlite.Connection,
+    table_name: str,
+    columns: dict[str, str],
+) -> None:
+    cursor = await db.execute(f"PRAGMA table_info({table_name})")
+    existing = {row[1] for row in await cursor.fetchall()}
+    for column, definition in columns.items():
+        if column not in existing:
+            await db.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {definition}")
 
 
 async def init_db(db_path: str) -> None:
@@ -20,28 +135,60 @@ async def init_db(db_path: str) -> None:
     global _db_path
     _db_path = db_path
 
-    # Ensure directory exists
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
     async with aiosqlite.connect(db_path) as db:
-        # Enable WAL mode for better concurrent read performance
         await db.execute("PRAGMA journal_mode=WAL")
 
-        await db.execute("""
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS projects (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'PLANNING',
+                status TEXT NOT NULL DEFAULT 'pending',
+                project_stage TEXT NOT NULL DEFAULT 'intake',
+                intake_text TEXT NOT NULL DEFAULT '',
+                intake_source TEXT NOT NULL DEFAULT 'manual',
+                source_ref TEXT,
                 plan_md TEXT,
                 stack_config_json TEXT,
+                repo_name TEXT,
+                repo_url TEXT,
+                repo_clone_url TEXT,
+                default_branch TEXT,
+                develop_branch TEXT,
+                feature_branch TEXT,
+                repo_ready INTEGER NOT NULL DEFAULT 0,
                 container_id TEXT,
                 port INTEGER,
+                preview_url TEXT,
+                preview_status TEXT NOT NULL DEFAULT 'pending',
+                preview_checked_at TEXT,
+                preview_metadata_json TEXT,
+                ci_status TEXT NOT NULL DEFAULT 'not_configured',
+                ci_run_id TEXT,
+                ci_run_url TEXT,
+                deploy_status TEXT NOT NULL DEFAULT 'not_configured',
+                deploy_run_url TEXT,
+                deploy_commit_sha TEXT,
+                deploy_target_json TEXT,
+                github_environment_name TEXT NOT NULL DEFAULT 'production',
+                last_workflow_sync_at TEXT,
+                plan_approved INTEGER NOT NULL DEFAULT 0,
+                preview_approved INTEGER NOT NULL DEFAULT 0,
+                plan_approved_at TEXT,
+                preview_approved_at TEXT,
+                approval_history_json TEXT,
+                last_deploy_at TEXT,
+                last_deploy_run_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
-        """)
+            """
+        )
 
-        await db.execute("""
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -51,9 +198,11 @@ async def init_db(db_path: str) -> None:
                 ended_at TEXT,
                 FOREIGN KEY (project_id) REFERENCES projects(id)
             )
-        """)
+            """
+        )
 
-        await db.execute("""
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS task_logs (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -65,9 +214,11 @@ async def init_db(db_path: str) -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             )
-        """)
+            """
+        )
 
-        await db.execute("""
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS chat_messages (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -76,55 +227,120 @@ async def init_db(db_path: str) -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (project_id) REFERENCES projects(id)
             )
-        """)
+            """
+        )
 
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deploy_runs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                output TEXT,
+                summary_json TEXT,
+                created_at TEXT NOT NULL,
+                deployed_at TEXT,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+            """
+        )
+
+        await _ensure_columns(db, "projects", PROJECT_COLUMN_DEFS)
         await db.commit()
         logger.info("Database initialized: %s", db_path)
 
 
-def _now() -> str:
-    """Get current UTC timestamp as ISO string."""
-    return datetime.now(timezone.utc).isoformat()
-
-
 async def create_project(
-    project_id: str, name: str, description: str
+    project_id: str,
+    name: str,
+    intake_text: str,
+    intake_source: str = "manual",
+    source_ref: str | None = None,
 ) -> dict[str, Any]:
     """Create a new project record."""
     now = _now()
     async with aiosqlite.connect(_db_path) as db:
         await db.execute(
             """
-            INSERT INTO projects (id, name, status, plan_md, created_at, updated_at)
-            VALUES (?, ?, 'PLANNING', ?, ?, ?)
+            INSERT INTO projects (
+                id,
+                name,
+                status,
+                project_stage,
+                intake_text,
+                intake_source,
+                source_ref,
+                plan_md,
+                stack_config_json,
+                preview_status,
+                ci_status,
+                deploy_status,
+                github_environment_name,
+                approval_history_json,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, 'pending', 'intake', ?, ?, ?, '', '{}', 'pending', 'not_configured', 'not_configured', ?, '[]', ?, ?)
             """,
-            (project_id, name, f"# {name}\n\n{description}", now, now),
+            (
+                project_id,
+                name,
+                intake_text,
+                intake_source,
+                source_ref,
+                settings.github_environment_name,
+                now,
+                now,
+            ),
         )
         await db.commit()
 
-    return await get_project(project_id)  # type: ignore[return-value]
+    project = await get_project(project_id)
+    if not project:
+        raise RuntimeError(f"Failed to create project {project_id}")
+    return project
 
 
 async def get_project(project_id: str) -> dict[str, Any] | None:
     """Get a project by ID."""
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM projects WHERE id = ?", (project_id,)
-        )
+        cursor = await db.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return _serialize_project_row(row) if row else None
 
 
 async def get_all_projects() -> list[dict[str, Any]]:
     """Get all projects ordered by creation date."""
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM projects ORDER BY created_at DESC"
-        )
+        cursor = await db.execute("SELECT * FROM projects ORDER BY created_at DESC")
         rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        return [_serialize_project_row(row) for row in rows]
+
+
+def _normalize_update_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(kwargs)
+
+    if "stack_config" in normalized:
+        normalized["stack_config_json"] = _json_dumps(normalized.pop("stack_config"))
+    if "deploy_target" in normalized:
+        normalized["deploy_target_json"] = _json_dumps(normalized.pop("deploy_target"))
+    if "preview_metadata" in normalized:
+        normalized["preview_metadata_json"] = _json_dumps(normalized.pop("preview_metadata"))
+    if "approval_history" in normalized:
+        normalized["approval_history_json"] = _json_dumps(normalized.pop("approval_history"))
+
+    for field in JSON_FIELDS:
+        if field in normalized and isinstance(normalized[field], (dict, list)):
+            normalized[field] = _json_dumps(normalized[field])
+
+    for field in BOOL_FIELDS:
+        if field in normalized:
+            normalized[field] = 1 if normalized[field] else 0
+
+    return normalized
 
 
 async def update_project(project_id: str, **kwargs: Any) -> None:
@@ -132,42 +348,208 @@ async def update_project(project_id: str, **kwargs: Any) -> None:
     if not kwargs:
         return
 
-    kwargs["updated_at"] = _now()
-    set_clause = ", ".join(f"{k} = ?" for k in kwargs)
-    values = list(kwargs.values()) + [project_id]
+    normalized = _normalize_update_kwargs(kwargs)
+    normalized["updated_at"] = _now()
+
+    set_clause = ", ".join(f"{key} = ?" for key in normalized)
+    values = list(normalized.values()) + [project_id]
 
     async with aiosqlite.connect(_db_path) as db:
-        await db.execute(
-            f"UPDATE projects SET {set_clause} WHERE id = ?",
-            values,
-        )
+        await db.execute(f"UPDATE projects SET {set_clause} WHERE id = ?", values)
         await db.commit()
 
 
 async def update_project_plan(project_id: str, plan_md: str) -> None:
-    """Update the PLAN.md content for a project."""
     await update_project(project_id, plan_md=plan_md)
 
 
 async def update_project_status(project_id: str, status: str) -> None:
-    """Update project status."""
     await update_project(project_id, status=status)
 
 
-async def update_project_container(
-    project_id: str, container_id: str, port: int
-) -> None:
-    """Update container info for a project."""
+async def update_project_stage(project_id: str, project_stage: str) -> None:
+    await update_project(project_id, project_stage=project_stage)
+
+
+async def update_project_container(project_id: str, container_id: str, port: int) -> None:
     await update_project(project_id, container_id=container_id, port=port)
 
 
-# ── Chat Messages ───────────────────────────────────────────────────────
+async def update_project_repo(project_id: str, **repo_fields: Any) -> None:
+    await update_project(project_id, **repo_fields)
 
 
-async def save_chat_message(
-    message_id: str, project_id: str, role: str, content: str
+async def update_project_preview(
+    project_id: str,
+    preview_url: str | None,
+    preview_status: str,
+    preview_metadata: dict[str, Any] | None = None,
 ) -> None:
-    """Save a chat message."""
+    await update_project(
+        project_id,
+        preview_url=preview_url,
+        preview_status=preview_status,
+        preview_metadata=preview_metadata or {},
+        preview_checked_at=_now(),
+    )
+
+
+async def update_project_deploy_target(project_id: str, deploy_target: dict[str, Any]) -> None:
+    await update_project(project_id, deploy_target=deploy_target, deploy_status="configured")
+
+
+async def update_project_cicd(
+    project_id: str,
+    *,
+    ci_status: str | None = None,
+    ci_run_id: str | None = None,
+    ci_run_url: str | None = None,
+    deploy_status: str | None = None,
+    deploy_run_url: str | None = None,
+    deploy_commit_sha: str | None = None,
+    github_environment_name: str | None = None,
+    last_workflow_sync_at: str | None = None,
+) -> None:
+    kwargs: dict[str, Any] = {}
+    if ci_status is not None:
+        kwargs["ci_status"] = ci_status
+    if ci_run_id is not None:
+        kwargs["ci_run_id"] = ci_run_id
+    if ci_run_url is not None:
+        kwargs["ci_run_url"] = ci_run_url
+    if deploy_status is not None:
+        kwargs["deploy_status"] = deploy_status
+    if deploy_run_url is not None:
+        kwargs["deploy_run_url"] = deploy_run_url
+    if deploy_commit_sha is not None:
+        kwargs["deploy_commit_sha"] = deploy_commit_sha
+    if github_environment_name is not None:
+        kwargs["github_environment_name"] = github_environment_name
+    if last_workflow_sync_at is not None:
+        kwargs["last_workflow_sync_at"] = last_workflow_sync_at
+    if kwargs:
+        await update_project(project_id, **kwargs)
+
+
+async def update_project_deploy_status(
+    project_id: str,
+    deploy_status: str,
+    *,
+    last_deploy_at: str | None = None,
+    last_deploy_run_id: str | None = None,
+    deploy_run_url: str | None = None,
+    deploy_commit_sha: str | None = None,
+) -> None:
+    kwargs: dict[str, Any] = {"deploy_status": deploy_status}
+    if last_deploy_at is not None:
+        kwargs["last_deploy_at"] = last_deploy_at
+    if last_deploy_run_id is not None:
+        kwargs["last_deploy_run_id"] = last_deploy_run_id
+    if deploy_run_url is not None:
+        kwargs["deploy_run_url"] = deploy_run_url
+    if deploy_commit_sha is not None:
+        kwargs["deploy_commit_sha"] = deploy_commit_sha
+    await update_project(project_id, **kwargs)
+
+
+async def record_approval(
+    project_id: str,
+    approval_type: str,
+    approved: bool,
+    *,
+    feedback: str | None = None,
+) -> None:
+    project = await get_project(project_id)
+    if not project:
+        return
+
+    history = list(project.get("approval_history", []))
+    history.append(
+        {
+            "type": approval_type,
+            "approved": approved,
+            "feedback": feedback,
+            "timestamp": _now(),
+        }
+    )
+
+    update_kwargs: dict[str, Any] = {"approval_history": history}
+    if approval_type == "plan" and approved:
+        update_kwargs["plan_approved"] = True
+        update_kwargs["plan_approved_at"] = _now()
+    if approval_type == "preview" and approved:
+        update_kwargs["preview_approved"] = True
+        update_kwargs["preview_approved_at"] = _now()
+
+    await update_project(project_id, **update_kwargs)
+
+
+async def sync_project_from_state(project_id: str, state: dict[str, Any]) -> None:
+    """Persist the relevant graph snapshot back into the project record."""
+    update_kwargs: dict[str, Any] = {}
+
+    if "plan_md" in state:
+        update_kwargs["plan_md"] = state.get("plan_md") or ""
+    if "stack_config" in state:
+        update_kwargs["stack_config"] = state.get("stack_config") or {}
+    if "container_id" in state:
+        update_kwargs["container_id"] = state.get("container_id") or None
+    if "container_port" in state:
+        update_kwargs["port"] = state.get("container_port") or None
+    if "project_stage" in state:
+        update_kwargs["project_stage"] = state.get("project_stage") or "intake"
+    if "status" in state:
+        update_kwargs["status"] = state.get("status") or "pending"
+    if "repo_name" in state:
+        update_kwargs["repo_name"] = state.get("repo_name") or None
+    if "repo_url" in state:
+        update_kwargs["repo_url"] = state.get("repo_url") or None
+    if "repo_clone_url" in state:
+        update_kwargs["repo_clone_url"] = state.get("repo_clone_url") or None
+    if "default_branch" in state:
+        update_kwargs["default_branch"] = state.get("default_branch") or None
+    if "develop_branch" in state:
+        update_kwargs["develop_branch"] = state.get("develop_branch") or None
+    if "feature_branch" in state:
+        update_kwargs["feature_branch"] = state.get("feature_branch") or None
+    if "repo_ready" in state:
+        update_kwargs["repo_ready"] = state.get("repo_ready", False)
+    if "preview_url" in state:
+        update_kwargs["preview_url"] = state.get("preview_url") or None
+    if "preview_status" in state:
+        update_kwargs["preview_status"] = state.get("preview_status") or "pending"
+    if "preview_metadata" in state:
+        update_kwargs["preview_metadata"] = state.get("preview_metadata") or {}
+    if "ci_status" in state:
+        update_kwargs["ci_status"] = state.get("ci_status") or "not_configured"
+    if "ci_run_id" in state:
+        update_kwargs["ci_run_id"] = state.get("ci_run_id") or None
+    if "ci_run_url" in state:
+        update_kwargs["ci_run_url"] = state.get("ci_run_url") or None
+    if "deploy_run_url" in state:
+        update_kwargs["deploy_run_url"] = state.get("deploy_run_url") or None
+    if "deploy_commit_sha" in state:
+        update_kwargs["deploy_commit_sha"] = state.get("deploy_commit_sha") or None
+    if "github_environment_name" in state:
+        update_kwargs["github_environment_name"] = state.get("github_environment_name") or None
+    if "last_workflow_sync_at" in state:
+        update_kwargs["last_workflow_sync_at"] = state.get("last_workflow_sync_at") or None
+    if "plan_approved" in state:
+        update_kwargs["plan_approved"] = state.get("plan_approved", False)
+    if "preview_approved" in state:
+        update_kwargs["preview_approved"] = state.get("preview_approved", False)
+    if "plan_approved_at" in state:
+        update_kwargs["plan_approved_at"] = state.get("plan_approved_at")
+    if "preview_approved_at" in state:
+        update_kwargs["preview_approved_at"] = state.get("preview_approved_at")
+
+    if update_kwargs:
+        if "preview_status" in update_kwargs:
+            update_kwargs["preview_checked_at"] = _now()
+        await update_project(project_id, **update_kwargs)
+
+
+async def save_chat_message(message_id: str, project_id: str, role: str, content: str) -> None:
     async with aiosqlite.connect(_db_path) as db:
         await db.execute(
             """
@@ -180,7 +562,6 @@ async def save_chat_message(
 
 
 async def get_chat_messages(project_id: str) -> list[dict[str, Any]]:
-    """Get all chat messages for a project."""
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -189,9 +570,6 @@ async def get_chat_messages(project_id: str) -> list[dict[str, Any]]:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-
-
-# ── Task Logs ───────────────────────────────────────────────────────────
 
 
 async def save_task_log(
@@ -203,7 +581,6 @@ async def save_task_log(
     cline_output: str,
     duration_s: float,
 ) -> None:
-    """Save a task execution log."""
     async with aiosqlite.connect(_db_path) as db:
         await db.execute(
             """
@@ -214,3 +591,101 @@ async def save_task_log(
             (log_id, session_id, task_index, task_text, status, cline_output, duration_s, _now()),
         )
         await db.commit()
+
+
+async def get_task_logs(project_id: str) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(_db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT task_logs.*
+            FROM task_logs
+            JOIN sessions ON sessions.id = task_logs.session_id
+            WHERE sessions.project_id = ?
+            ORDER BY task_logs.created_at
+            """,
+            (project_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def save_deploy_run(
+    run_id: str,
+    project_id: str,
+    status: str,
+    branch: str,
+    output: str,
+    summary: dict[str, Any] | None = None,
+    *,
+    deployed_at: str | None = None,
+) -> None:
+    async with aiosqlite.connect(_db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO deploy_runs (id, project_id, status, branch, output, summary_json, created_at, deployed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                project_id,
+                status,
+                branch,
+                output,
+                _json_dumps(summary or {}),
+                _now(),
+                deployed_at,
+            ),
+        )
+        await db.commit()
+
+
+async def upsert_deploy_run(
+    run_id: str,
+    project_id: str,
+    status: str,
+    branch: str,
+    output: str,
+    summary: dict[str, Any] | None = None,
+    *,
+    deployed_at: str | None = None,
+) -> None:
+    async with aiosqlite.connect(_db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT created_at FROM deploy_runs WHERE id = ?", (run_id,))
+        existing = await cursor.fetchone()
+        created_at = existing["created_at"] if existing else _now()
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO deploy_runs
+                (id, project_id, status, branch, output, summary_json, created_at, deployed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                project_id,
+                status,
+                branch,
+                output,
+                _json_dumps(summary or {}),
+                created_at,
+                deployed_at,
+            ),
+        )
+        await db.commit()
+
+
+async def get_deploy_runs(project_id: str) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(_db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM deploy_runs WHERE project_id = ? ORDER BY created_at DESC",
+            (project_id,),
+        )
+        rows = await cursor.fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["summary"] = _json_loads(item.pop("summary_json", "{}"), {})
+            result.append(item)
+        return result

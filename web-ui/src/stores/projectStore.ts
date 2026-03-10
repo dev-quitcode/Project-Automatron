@@ -1,112 +1,155 @@
 import { create } from "zustand";
-import type {
-  Project,
-  ChatMessage,
-  BuilderLog,
-  ProjectStatus,
-  PlanProgress,
-} from "@/lib/types";
 import * as api from "@/lib/api";
+import type {
+  BuilderLog,
+  ChatMessage,
+  DeployRun,
+  DeployTargetRequest,
+  PlanProgress,
+  Project,
+  ProjectStage,
+} from "@/lib/types";
 
-// ── Project Store ─────────────────────────────────────────
 interface ProjectState {
-  // Data
   projects: Project[];
   currentProject: Project | null;
   chatMessages: ChatMessage[];
   builderLogs: BuilderLog[];
+  deployRuns: DeployRun[];
   planMd: string | null;
   isConnected: boolean;
   isLoading: boolean;
   error: string | null;
-
-  // Human intervention
   humanRequired: boolean;
   humanReason: string | null;
-
-  // Progress
+  humanStage: ProjectStage | null;
   progress: PlanProgress | null;
 
-  // Actions
   setProjects: (projects: Project[]) => void;
   setCurrentProject: (project: Project | null) => void;
-  updateProjectStatus: (projectId: string, status: ProjectStatus) => void;
+  patchProject: (projectId: string, patch: Partial<Project>) => void;
   addChatMessage: (message: ChatMessage) => void;
   setChatMessages: (messages: ChatMessage[]) => void;
   addBuilderLog: (log: BuilderLog) => void;
+  setBuilderLogs: (logs: BuilderLog[]) => void;
   clearBuilderLogs: () => void;
+  setDeployRuns: (deployRuns: DeployRun[]) => void;
   setPlanMd: (planMd: string | null) => void;
   setConnected: (connected: boolean) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
-  setHumanRequired: (required: boolean, reason?: string) => void;
+  setHumanRequired: (
+    required: boolean,
+    reason?: string,
+    stage?: ProjectStage | null
+  ) => void;
   setProgress: (progress: PlanProgress | null) => void;
 
-  // Async actions
   fetchProjects: () => Promise<void>;
   fetchProject: (id: string) => Promise<void>;
-  createProject: (name: string, description: string) => Promise<Project>;
+  createProject: (name: string, intakeText: string) => Promise<Project>;
   startProject: (id: string) => Promise<void>;
   stopProject: (id: string) => Promise<void>;
-  approveProject: (id: string, feedback?: string) => Promise<void>;
+  approvePlan: (id: string, feedback?: string) => Promise<void>;
+  approvePreview: (id: string, feedback?: string) => Promise<void>;
+  deployProject: (id: string) => Promise<void>;
+  syncCicd: (id: string) => Promise<void>;
   fetchChatHistory: (projectId: string) => Promise<void>;
+  fetchLogs: (projectId: string) => Promise<void>;
+  fetchDeployRuns: (projectId: string) => Promise<void>;
   fetchPlan: (projectId: string) => Promise<void>;
   updatePlan: (projectId: string, planMd: string) => Promise<void>;
+  updateDeployTarget: (
+    projectId: string,
+    target: DeployTargetRequest
+  ) => Promise<void>;
+}
+
+function getHumanReason(stage?: ProjectStage | null): string | null {
+  if (stage === "awaiting_plan_approval") {
+    return "Review and approve the technical plan.";
+  }
+  if (stage === "awaiting_preview_approval") {
+    return "Preview is ready. Review it before promoting to develop.";
+  }
+  return null;
+}
+
+function applyProjectPatch(
+  project: Project | null,
+  projectId: string,
+  patch: Partial<Project>
+): Project | null {
+  if (!project || project.id !== projectId) {
+    return project;
+  }
+  return { ...project, ...patch };
 }
 
 export const useProjectStore = create<ProjectState>((set, get) => ({
-  // Initial state
   projects: [],
   currentProject: null,
   chatMessages: [],
   builderLogs: [],
+  deployRuns: [],
   planMd: null,
   isConnected: false,
   isLoading: false,
   error: null,
   humanRequired: false,
   humanReason: null,
+  humanStage: null,
   progress: null,
 
-  // Setters
   setProjects: (projects) => set({ projects }),
-  setCurrentProject: (project) => set({ currentProject: project }),
-  updateProjectStatus: (projectId, status) =>
+  setCurrentProject: (project) =>
+    set({
+      currentProject: project,
+      planMd: project?.plan_md ?? null,
+      humanRequired:
+        project?.project_stage === "awaiting_plan_approval" ||
+        project?.project_stage === "awaiting_preview_approval",
+      humanReason: getHumanReason(project?.project_stage ?? null),
+      humanStage:
+        project?.project_stage === "awaiting_plan_approval" ||
+        project?.project_stage === "awaiting_preview_approval"
+          ? project.project_stage
+          : null,
+    }),
+  patchProject: (projectId, patch) =>
     set((state) => ({
-      projects: state.projects.map((p) =>
-        p.id === projectId ? { ...p, status } : p
+      projects: state.projects.map((project) =>
+        project.id === projectId ? { ...project, ...patch } : project
       ),
-      currentProject:
-        state.currentProject?.id === projectId
-          ? { ...state.currentProject, status }
-          : state.currentProject,
+      currentProject: applyProjectPatch(state.currentProject, projectId, patch),
     })),
   addChatMessage: (message) =>
-    set((state) => ({
-      chatMessages: [...state.chatMessages, message],
-    })),
+    set((state) => ({ chatMessages: [...state.chatMessages, message] })),
   setChatMessages: (messages) => set({ chatMessages: messages }),
   addBuilderLog: (log) =>
-    set((state) => ({
-      builderLogs: [...state.builderLogs, log],
-    })),
+    set((state) => ({ builderLogs: [...state.builderLogs, log] })),
+  setBuilderLogs: (builderLogs) => set({ builderLogs }),
   clearBuilderLogs: () => set({ builderLogs: [] }),
+  setDeployRuns: (deployRuns) => set({ deployRuns }),
   setPlanMd: (planMd) => set({ planMd }),
   setConnected: (connected) => set({ isConnected: connected }),
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error }),
-  setHumanRequired: (required, reason) =>
-    set({ humanRequired: required, humanReason: reason || null }),
+  setHumanRequired: (required, reason, stage) =>
+    set({
+      humanRequired: required,
+      humanReason: reason || getHumanReason(stage),
+      humanStage: required ? stage || null : null,
+    }),
   setProgress: (progress) => set({ progress }),
 
-  // Async actions
   fetchProjects: async () => {
     set({ isLoading: true, error: null });
     try {
       const projects = await api.getProjects();
       set({ projects, isLoading: false });
-    } catch (e: any) {
-      set({ error: e.message, isLoading: false });
+    } catch (error: any) {
+      set({ error: error.message, isLoading: false });
     }
   },
 
@@ -114,24 +157,44 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       const project = await api.getProject(id);
-      set({ currentProject: project, isLoading: false });
-    } catch (e: any) {
-      set({ error: e.message, isLoading: false });
+      set((state) => ({
+        projects: state.projects.some((item) => item.id === project.id)
+          ? state.projects.map((item) => (item.id === project.id ? project : item))
+          : [project, ...state.projects],
+        currentProject: project,
+        planMd: project.plan_md,
+        humanRequired:
+          project.project_stage === "awaiting_plan_approval" ||
+          project.project_stage === "awaiting_preview_approval",
+        humanReason: getHumanReason(project.project_stage),
+        humanStage:
+          project.project_stage === "awaiting_plan_approval" ||
+          project.project_stage === "awaiting_preview_approval"
+            ? project.project_stage
+            : null,
+        isLoading: false,
+      }));
+    } catch (error: any) {
+      set({ error: error.message, isLoading: false });
     }
   },
 
-  createProject: async (name, description) => {
+  createProject: async (name, intakeText) => {
     set({ isLoading: true, error: null });
     try {
-      const project = await api.createProject({ name, description });
+      const project = await api.createProject({
+        name,
+        intake_text: intakeText,
+        source: "manual",
+      });
       set((state) => ({
         projects: [...state.projects, project],
         isLoading: false,
       }));
       return project;
-    } catch (e: any) {
-      set({ error: e.message, isLoading: false });
-      throw e;
+    } catch (error: any) {
+      set({ error: error.message, isLoading: false });
+      throw error;
     }
   },
 
@@ -139,9 +202,12 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     set({ error: null });
     try {
       await api.startProject(id);
-      get().updateProjectStatus(id, "planning");
-    } catch (e: any) {
-      set({ error: e.message });
+      get().patchProject(id, {
+        status: "planning",
+        project_stage: "planning",
+      });
+    } catch (error: any) {
+      set({ error: error.message });
     }
   },
 
@@ -149,18 +215,84 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     set({ error: null });
     try {
       await api.stopProject(id);
-      get().updateProjectStatus(id, "paused");
-    } catch (e: any) {
-      set({ error: e.message });
+      get().patchProject(id, { status: "paused" });
+    } catch (error: any) {
+      set({ error: error.message });
     }
   },
 
-  approveProject: async (id, feedback) => {
-    set({ error: null, humanRequired: false, humanReason: null });
+  approvePlan: async (id, feedback) => {
+    set({
+      error: null,
+      humanRequired: false,
+      humanReason: null,
+      humanStage: null,
+    });
     try {
-      await api.approveProject(id, feedback);
-    } catch (e: any) {
-      set({ error: e.message });
+      await api.approvePlan(id, feedback);
+      get().patchProject(id, {
+        plan_approved: true,
+        status: "planning",
+      });
+    } catch (error: any) {
+      set({ error: error.message });
+    }
+  },
+
+  approvePreview: async (id, feedback) => {
+    set({
+      error: null,
+      humanRequired: false,
+      humanReason: null,
+      humanStage: null,
+    });
+    try {
+      await api.approvePreview(id, feedback);
+      get().patchProject(id, {
+        preview_approved: true,
+        status: "planning",
+      });
+    } catch (error: any) {
+      set({ error: error.message });
+    }
+  },
+
+  deployProject: async (id) => {
+    set({ error: null });
+    try {
+      const result = await api.deployProject(id);
+      const status =
+        result.status === "deployed"
+          ? "deployed"
+          : result.status === "queued" || result.status === "running"
+          ? "deploying"
+          : result.status === "failed"
+          ? "error"
+          : "deploying";
+      get().patchProject(id, {
+        status,
+        project_stage: status === "deployed" ? "deployed" : "deploying",
+      });
+      await get().fetchProject(id);
+      await get().fetchDeployRuns(id);
+    } catch (error: any) {
+      set({ error: error.message });
+    }
+  },
+
+  syncCicd: async (id) => {
+    try {
+      const project = await api.syncProjectCicd(id);
+      set((state) => ({
+        projects: state.projects.some((item) => item.id === project.id)
+          ? state.projects.map((item) => (item.id === project.id ? project : item))
+          : [project, ...state.projects],
+        currentProject: state.currentProject?.id === project.id ? project : state.currentProject,
+        planMd: state.currentProject?.id === project.id ? project.plan_md : state.planMd,
+      }));
+      await get().fetchDeployRuns(id);
+    } catch (error: any) {
+      set({ error: error.message });
     }
   },
 
@@ -168,8 +300,26 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     try {
       const messages = await api.getChatHistory(projectId);
       set({ chatMessages: messages });
-    } catch (e: any) {
-      set({ error: e.message });
+    } catch (error: any) {
+      set({ error: error.message });
+    }
+  },
+
+  fetchLogs: async (projectId) => {
+    try {
+      const logs = await api.getProjectLogs(projectId);
+      set({ builderLogs: logs });
+    } catch (error: any) {
+      set({ error: error.message });
+    }
+  },
+
+  fetchDeployRuns: async (projectId) => {
+    try {
+      const deployRuns = await api.getDeployRuns(projectId);
+      set({ deployRuns });
+    } catch (error: any) {
+      set({ error: error.message });
     }
   },
 
@@ -177,8 +327,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     try {
       const { plan_md } = await api.getProjectPlan(projectId);
       set({ planMd: plan_md });
-    } catch (e: any) {
-      set({ error: e.message });
+    } catch (error: any) {
+      set({ error: error.message });
     }
   },
 
@@ -186,8 +336,30 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     try {
       await api.updateProjectPlan(projectId, planMd);
       set({ planMd });
-    } catch (e: any) {
-      set({ error: e.message });
+      get().patchProject(projectId, { plan_md: planMd });
+    } catch (error: any) {
+      set({ error: error.message });
+    }
+  },
+
+  updateDeployTarget: async (projectId, target) => {
+    try {
+      await api.updateDeployTarget(projectId, target);
+      get().patchProject(projectId, {
+        deploy_status: "configured",
+        deploy_target_summary: {
+          host: target.host,
+          port: target.port ?? 22,
+          user: target.user,
+          deploy_path: target.deploy_path,
+          auth_reference: target.auth_reference ?? null,
+          app_url: target.app_url ?? null,
+          health_path: target.health_path ?? null,
+        },
+      });
+    } catch (error: any) {
+      set({ error: error.message });
+      throw error;
     }
   },
 }));

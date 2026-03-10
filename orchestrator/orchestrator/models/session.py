@@ -1,4 +1,4 @@
-"""Session models — tracks LangGraph execution sessions."""
+"""Session models tracking graph execution sessions."""
 
 from __future__ import annotations
 
@@ -7,8 +7,7 @@ from typing import Any
 
 import aiosqlite
 
-# DB path is shared with project module
-from orchestrator.models.project import _db_path
+from orchestrator.models import project as project_model
 
 
 def _now() -> str:
@@ -16,10 +15,12 @@ def _now() -> str:
 
 
 async def create_session(
-    session_id: str, project_id: str, thread_id: str, phase: str
+    session_id: str,
+    project_id: str,
+    thread_id: str,
+    phase: str,
 ) -> dict[str, Any]:
-    """Create a new session record."""
-    async with aiosqlite.connect(_db_path) as db:
+    async with aiosqlite.connect(project_model._db_path) as db:
         await db.execute(
             """
             INSERT INTO sessions (id, project_id, thread_id, phase, started_at)
@@ -38,19 +39,20 @@ async def create_session(
     }
 
 
+async def update_session_phase(session_id: str, phase: str) -> None:
+    async with aiosqlite.connect(project_model._db_path) as db:
+        await db.execute("UPDATE sessions SET phase = ? WHERE id = ?", (phase, session_id))
+        await db.commit()
+
+
 async def end_session(session_id: str) -> None:
-    """Mark a session as ended."""
-    async with aiosqlite.connect(_db_path) as db:
-        await db.execute(
-            "UPDATE sessions SET ended_at = ? WHERE id = ?",
-            (_now(), session_id),
-        )
+    async with aiosqlite.connect(project_model._db_path) as db:
+        await db.execute("UPDATE sessions SET ended_at = ? WHERE id = ?", (_now(), session_id))
         await db.commit()
 
 
 async def get_sessions(project_id: str) -> list[dict[str, Any]]:
-    """Get all sessions for a project."""
-    async with aiosqlite.connect(_db_path) as db:
+    async with aiosqlite.connect(project_model._db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM sessions WHERE project_id = ? ORDER BY started_at DESC",

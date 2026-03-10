@@ -11,13 +11,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from orchestrator.api.routes import router as api_router
+from orchestrator.api.socket_server import sio
 from orchestrator.config import settings
 from orchestrator.models.project import init_db
 
 logger = logging.getLogger(__name__)
-
-# --- Socket.IO server ---
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
 
 @asynccontextmanager
@@ -62,6 +60,10 @@ def create_app() -> FastAPI:
 # --- ASGI app with Socket.IO ---
 fastapi_app = create_app()
 combined_app = socketio.ASGIApp(sio, other_app=fastapi_app)
+app = combined_app
+
+# Register Socket.IO event handlers.
+from orchestrator.api import websocket as _websocket  # noqa: F401,E402
 
 if __name__ == "__main__":
     import uvicorn

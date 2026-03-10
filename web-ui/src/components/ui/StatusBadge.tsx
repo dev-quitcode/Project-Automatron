@@ -1,6 +1,11 @@
 "use client";
 
-import { cn, getStatusColor, getStatusBgColor } from "@/lib/utils";
+import {
+  cn,
+  formatStatusLabel,
+  getStatusBgColor,
+  getStatusColor,
+} from "@/lib/utils";
 import type { ProjectStatus } from "@/lib/types";
 
 interface StatusBadgeProps {
@@ -9,7 +14,7 @@ interface StatusBadgeProps {
   pulse?: boolean;
 }
 
-const activeStatuses: ProjectStatus[] = ["planning", "building", "reviewing"];
+const activeStatuses: ProjectStatus[] = ["planning", "building", "deploying"];
 
 export function StatusBadge({
   status,
@@ -36,7 +41,7 @@ export function StatusBadge({
                 ? "bg-blue-400"
                 : status === "building"
                 ? "bg-amber-400"
-                : "bg-purple-400"
+                : "bg-violet-400"
             )}
           />
           <span
@@ -46,12 +51,12 @@ export function StatusBadge({
                 ? "bg-blue-500"
                 : status === "building"
                 ? "bg-amber-500"
-                : "bg-purple-500"
+                : "bg-violet-500"
             )}
           />
         </span>
       )}
-      {status}
+      {formatStatusLabel(status)}
     </span>
   );
 }

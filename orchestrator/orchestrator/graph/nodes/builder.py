@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import shlex
-import tempfile
+import time
 
 from orchestrator.config import settings
 from orchestrator.docker_engine.manager import ContainerManager
@@ -17,132 +17,103 @@ container_manager = ContainerManager()
 
 
 async def builder_node(state: AutomatronState) -> dict:
-    """Builder node: runs Cline CLI inside the project's Docker container.
-
-    Sequence:
-    1. Read current task + global rules from PLAN.md frontmatter
-    2. Build Cline prompt with task + context + rules
-    3. Write prompt to a temp file inside the container (avoids shell injection)
-    4. Execute `cline -y --task-file` inside Docker container
-    5. Capture stdout/stderr
-    6. Read updated PLAN.md from container (Cline may mark [x])
-    7. Return output for status classification
-    """
+    """Run the current task in the project container."""
     container_id = state.get("container_id", "")
     task_text = state.get("current_task_text", "")
     task_index = state.get("current_task_index", -1)
     plan_md = state.get("plan_md", "")
 
     if not container_id:
-        logger.error("Builder: no container_id in state")
         return {
             "builder_status": "BLOCKER",
-            "builder_output": "",
             "builder_error_detail": "No Docker container available",
-            "phase": "EXECUTING",
-        }
-
-    if not task_text:
-        logger.error("Builder: no task_text in state")
-        return {
-            "builder_status": "BLOCKER",
             "builder_output": "",
-            "builder_error_detail": "No task text provided",
-            "phase": "EXECUTING",
+            "project_stage": "building",
+            "status": "building",
         }
-
-    # Extract global rules from PLAN.md frontmatter
-    global_rules = get_global_rules(plan_md)
-    rules_text = "\n".join(f"- {r}" for r in global_rules) if global_rules else "None"
-
-    # Build the Cline prompt
-    cline_prompt = (
-        f"You are a coder. Execute ONLY this task:\n\n"
-        f"TASK: {task_text}\n\n"
-        f"GLOBAL RULES:\n{rules_text}\n\n"
-        f"IMPORTANT:\n"
-        f"- Do NOT change the architecture\n"
-        f"- Do NOT delete existing files unless explicitly instructed\n"
-        f"- Follow the global rules strictly\n"
-        f"- Work in /workspace directory\n"
-    )
-
-    logger.info(
-        "Builder: executing task %d in container %s",
-        task_index,
-        container_id[:12],
-    )
-
-    # Copy PLAN.md into container
-    try:
-        await container_manager.copy_file_to_container(
-            container_id, plan_md, "/workspace/PLAN.md"
-        )
-    except Exception as e:
-        logger.warning("Builder: failed to copy PLAN.md: %s", e)
-
-    # Write prompt to a temp file inside the container to avoid shell injection.
-    # The prompt may contain quotes, backticks, etc. — file-based approach is safe.
-    prompt_container_path = "/tmp/automatron_task_prompt.txt"
-    try:
-        await container_manager.copy_file_to_container(
-            container_id, cline_prompt, prompt_container_path
-        )
-    except Exception as e:
-        logger.error("Builder: failed to write prompt file: %s", e)
+    if not task_text:
         return {
             "builder_status": "BLOCKER",
-            "builder_output": str(e),
-            "builder_error_detail": f"Failed to write prompt file: {e}",
-            "phase": "EXECUTING",
+            "builder_error_detail": "No task text provided",
+            "builder_output": "",
+            "project_stage": "building",
+            "status": "building",
         }
 
-    # Execute Cline CLI using the prompt file — avoids shell injection
-    # shlex.quote is used for the model name and file path as extra safety
+    global_rules = get_global_rules(plan_md)
+    rules_text = "\n".join(f"- {rule}" for rule in global_rules) if global_rules else "- None"
+    stack_config = state.get("stack_config", {})
+    preview_port = state.get("container_port", 3000)
+    preview_requirement = (
+        "By the end of the plan, the repo must contain Dockerfile, .env.example, "
+        "deploy/docker-compose.yml, DEPLOY.md, .github/workflows/ci.yml, "
+        "and .github/workflows/deploy.yml. Preview must be able to run on the allocated port."
+    )
+
+    cline_prompt = (
+        "You are Automatron Builder operating inside the project workspace.\n\n"
+        f"CURRENT TASK:\n{task_text}\n\n"
+        f"STACK CONFIG:\n{stack_config}\n\n"
+        f"GLOBAL RULES:\n{rules_text}\n\n"
+        "REQUIRED OUTPUT CONTRACT:\n"
+        f"- {preview_requirement}\n"
+        f"- The active preview port is {preview_port}\n"
+        "- Keep PLAN.md in sync with completed tasks\n"
+        "- Do not remove the existing git repository\n"
+        "- Preserve the generated GitHub Actions workflows unless intentionally updating them\n"
+        "- Do not access external deployment credentials\n"
+    )
+
+    try:
+        await container_manager.copy_file_to_container(container_id, plan_md, "/workspace/PLAN.md")
+        await container_manager.copy_file_to_container(
+            container_id,
+            cline_prompt,
+            "/tmp/automatron_task_prompt.txt",
+        )
+    except Exception as exc:
+        return {
+            "builder_status": "BLOCKER",
+            "builder_output": str(exc),
+            "builder_error_detail": f"Failed to prepare Cline prompt: {exc}",
+            "project_stage": "building",
+            "status": "building",
+        }
+
     model = shlex.quote(settings.builder_model)
     timeout = settings.builder_cline_timeout
-    prompt_path_quoted = shlex.quote(prompt_container_path)
-
-    cline_command = (
+    command = (
         f"cline -y -m {model} --timeout {timeout} "
-        f"--cwd /workspace --task-file {prompt_path_quoted}"
+        "--cwd /workspace --task-file /tmp/automatron_task_prompt.txt"
     )
 
+    started = time.monotonic()
     try:
-        result = await container_manager.exec_in_container(
-            container_id, cline_command, timeout=timeout + 30
-        )
-        exit_code = result.exit_code
+        result = await container_manager.exec_in_container(container_id, command, timeout=timeout + 30)
         output = result.output
-    except Exception as e:
-        logger.error("Builder: Cline execution failed: %s", e)
+        exit_code = result.exit_code
+    except Exception as exc:
         return {
             "builder_status": "BLOCKER",
-            "builder_output": str(e),
-            "builder_error_detail": f"Cline CLI execution error: {e}",
-            "phase": "EXECUTING",
+            "builder_output": str(exc),
+            "builder_error_detail": f"Cline execution failed: {exc}",
+            "builder_duration_s": time.monotonic() - started,
+            "project_stage": "building",
+            "status": "building",
         }
 
-    # Try to read updated PLAN.md from container
     updated_plan = plan_md
     try:
-        updated_plan = await container_manager.read_file_from_container(
-            container_id, "/workspace/PLAN.md"
-        )
-    except Exception as e:
-        logger.warning("Builder: could not read PLAN.md from container: %s", e)
-
-    logger.info(
-        "Builder: task %d completed (exit_code=%d, output=%d chars)",
-        task_index,
-        exit_code,
-        len(output),
-    )
+        updated_plan = await container_manager.read_file_from_container(container_id, "/workspace/PLAN.md")
+    except Exception as exc:
+        logger.warning("Could not read PLAN.md after task %d: %s", task_index, exc)
 
     return {
         "builder_output": output,
         "builder_error_detail": "" if exit_code == 0 else output[-2000:],
+        "builder_exit_code": exit_code,
+        "builder_duration_s": time.monotonic() - started,
         "plan_md": updated_plan,
-        "phase": "EXECUTING",
-        # builder_status will be set by status_classifier_node
+        "project_stage": "building",
+        "status": "building",
     }

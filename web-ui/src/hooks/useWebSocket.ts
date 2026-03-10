@@ -1,36 +1,41 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
-import { getSocket, connectSocket, disconnectSocket, joinProjectRoom, leaveProjectRoom } from "@/lib/socket";
+import { useCallback, useEffect, useRef } from "react";
+import {
+  connectSocket,
+  disconnectSocket,
+  getSocket,
+  joinProjectRoom,
+  leaveProjectRoom,
+} from "@/lib/socket";
 import { useProjectStore } from "@/stores/projectStore";
 import type {
+  BuilderLog,
+  ChatMessage,
   WsArchitectMessage,
   WsBuilderLog,
-  WsStatusUpdate,
   WsHumanRequired,
   WsPlanUpdated,
-  ChatMessage,
-  BuilderLog,
+  WsStatusUpdate,
 } from "@/lib/types";
 
 export function useWebSocket(projectId?: string) {
-  const prevProjectId = useRef<string | null>(null);
+  const previousProjectId = useRef<string | null>(null);
   const {
-    setConnected,
-    addChatMessage,
     addBuilderLog,
-    updateProjectStatus,
+    addChatMessage,
+    patchProject,
+    setConnected,
     setHumanRequired,
     setPlanMd,
+    setProgress,
   } = useProjectStore();
 
-  // Connect & bind global listeners
   useEffect(() => {
     const socket = connectSocket();
 
     socket.on("connect", () => {
       setConnected(true);
-      // Rejoin room if we reconnect
       if (projectId) {
         joinProjectRoom(projectId);
       }
@@ -40,22 +45,27 @@ export function useWebSocket(projectId?: string) {
       setConnected(false);
     });
 
-    // ── Architect streaming message ───────────────────────
     socket.on("architect:message", (data: WsArchitectMessage) => {
-      if (!data.is_streaming) {
-        const msg: ChatMessage = {
-          id: crypto.randomUUID(),
-          project_id: data.project_id,
-          role: "architect",
-          content: data.content,
-          timestamp: new Date().toISOString(),
-        };
-        addChatMessage(msg);
+      if (projectId && data.project_id !== projectId) {
+        return;
       }
+      if (data.is_streaming) {
+        return;
+      }
+      const message: ChatMessage = {
+        id: crypto.randomUUID(),
+        project_id: data.project_id,
+        role: "architect",
+        content: data.content,
+        timestamp: new Date().toISOString(),
+      };
+      addChatMessage(message);
     });
 
-    // ── Builder log ───────────────────────────────────────
     socket.on("builder:log", (data: WsBuilderLog) => {
+      if (projectId && data.project_id !== projectId) {
+        return;
+      }
       const log: BuilderLog = {
         project_id: data.project_id,
         task_index: data.task_index,
@@ -68,19 +78,38 @@ export function useWebSocket(projectId?: string) {
       addBuilderLog(log);
     });
 
-    // ── Status update ─────────────────────────────────────
     socket.on("status:update", (data: WsStatusUpdate) => {
-      updateProjectStatus(data.project_id, data.status);
+      patchProject(data.project_id, {
+        status: data.status,
+        project_stage: data.stage,
+        preview_url: data.preview_url ?? null,
+      });
+
+      if (!projectId || data.project_id === projectId) {
+        const total = data.progress?.total ?? 0;
+        const completed = data.progress?.completed ?? 0;
+        setProgress({
+          total,
+          completed,
+          percentage: total > 0 ? Math.round((completed / total) * 100) : 0,
+        });
+      }
     });
 
-    // ── Human intervention required ───────────────────────
     socket.on("human:required", (data: WsHumanRequired) => {
-      setHumanRequired(true, data.reason);
+      if (!projectId || data.project_id === projectId) {
+        setHumanRequired(true, data.reason, data.stage ?? null);
+      }
+      if (data.stage) {
+        patchProject(data.project_id, { project_stage: data.stage });
+      }
     });
 
-    // ── Plan updated ──────────────────────────────────────
     socket.on("plan:updated", (data: WsPlanUpdated) => {
-      setPlanMd(data.plan_md);
+      patchProject(data.project_id, { plan_md: data.plan_md });
+      if (!projectId || data.project_id === projectId) {
+        setPlanMd(data.plan_md);
+      }
     });
 
     return () => {
@@ -93,17 +122,26 @@ export function useWebSocket(projectId?: string) {
       socket.off("plan:updated");
       disconnectSocket();
     };
-  }, []);
+  }, [
+    addBuilderLog,
+    addChatMessage,
+    patchProject,
+    projectId,
+    setConnected,
+    setHumanRequired,
+    setPlanMd,
+    setProgress,
+  ]);
 
-  // Join/leave project rooms
   useEffect(() => {
-    if (prevProjectId.current && prevProjectId.current !== projectId) {
-      leaveProjectRoom(prevProjectId.current);
+    if (previousProjectId.current && previousProjectId.current !== projectId) {
+      leaveProjectRoom(previousProjectId.current);
     }
+
     if (projectId) {
       joinProjectRoom(projectId);
     }
-    prevProjectId.current = projectId || null;
+    previousProjectId.current = projectId || null;
 
     return () => {
       if (projectId) {
@@ -115,20 +153,20 @@ export function useWebSocket(projectId?: string) {
   const sendMessage = useCallback(
     (message: string) => {
       if (!projectId) return;
+
       const socket = getSocket();
       socket.emit("chat:message", { project_id: projectId, message });
 
-      // Optimistic local add
-      const msg: ChatMessage = {
+      const optimisticMessage: ChatMessage = {
         id: crypto.randomUUID(),
         project_id: projectId,
         role: "user",
         content: message,
         timestamp: new Date().toISOString(),
       };
-      addChatMessage(msg);
+      addChatMessage(optimisticMessage);
     },
-    [projectId, addChatMessage]
+    [addChatMessage, projectId]
   );
 
   return { sendMessage };

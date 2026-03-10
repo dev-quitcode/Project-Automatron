@@ -1,31 +1,48 @@
 import type {
+  BuilderLog,
+  ChatMessage,
+  DeployRun,
+  DeployTargetRequest,
   Project,
   ProjectCreateRequest,
-  ChatMessage,
-  TaskLog,
   Session,
-  PlanProgress,
 } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-// ── Helper ────────────────────────────────────────────────
-async function request<T>(
-  path: string,
-  options?: RequestInit
-): Promise<T> {
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`API ${res.status}: ${body}`);
+    throw new Error(`API ${res.status}: ${await res.text()}`);
   }
   return res.json();
 }
 
-// ── Projects ──────────────────────────────────────────────
+function mapChatMessage(message: any): ChatMessage {
+  return {
+    id: message.id,
+    project_id: message.project_id,
+    role: message.role,
+    content: message.content,
+    timestamp: message.created_at,
+  };
+}
+
+function mapBuilderLog(log: any): BuilderLog {
+  return {
+    project_id: log.project_id || "",
+    task_index: log.task_index,
+    task_text: log.task_text || "",
+    status: log.status,
+    output: log.output || log.cline_output || "",
+    error_detail: log.error_detail || null,
+    timestamp: log.created_at || new Date().toISOString(),
+  };
+}
+
 export async function getProjects(): Promise<Project[]> {
   return request("/api/projects");
 }
@@ -34,9 +51,13 @@ export async function getProject(id: string): Promise<Project> {
   return request(`/api/projects/${id}`);
 }
 
-export async function createProject(
-  data: ProjectCreateRequest
-): Promise<Project> {
+export async function syncProjectCicd(id: string): Promise<Project> {
+  return request(`/api/projects/${id}/sync-cicd`, {
+    method: "POST",
+  });
+}
+
+export async function createProject(data: ProjectCreateRequest): Promise<Project> {
   return request("/api/projects", {
     method: "POST",
     body: JSON.stringify(data),
@@ -44,36 +65,48 @@ export async function createProject(
 }
 
 export async function deleteProject(id: string): Promise<void> {
-  return request(`/api/projects/${id}`, { method: "DELETE" });
+  await request(`/api/projects/${id}`, { method: "DELETE" });
 }
 
-// ── Orchestration ─────────────────────────────────────────
 export async function startProject(projectId: string): Promise<{ status: string }> {
-  return request(`/api/projects/${projectId}/start`, {
-    method: "POST",
-  });
+  return request(`/api/projects/${projectId}/start`, { method: "POST" });
 }
 
 export async function stopProject(projectId: string): Promise<{ status: string }> {
-  return request(`/api/projects/${projectId}/stop`, {
-    method: "POST",
-  });
+  return request(`/api/projects/${projectId}/stop`, { method: "POST" });
 }
 
-export async function approveProject(
+export async function approvePlan(
   projectId: string,
   feedback?: string
 ): Promise<{ status: string }> {
-  return request(`/api/projects/${projectId}/approve`, {
+  return request(`/api/projects/${projectId}/approve-plan`, {
     method: "POST",
     body: JSON.stringify({ feedback }),
   });
 }
 
-// ── Plan ──────────────────────────────────────────────────
+export async function approvePreview(
+  projectId: string,
+  feedback?: string
+): Promise<{ status: string }> {
+  return request(`/api/projects/${projectId}/approve-preview`, {
+    method: "POST",
+    body: JSON.stringify({ feedback }),
+  });
+}
+
+export async function deployProject(
+  projectId: string
+): Promise<{ status: string }> {
+  return request(`/api/projects/${projectId}/deploy`, {
+    method: "POST",
+  });
+}
+
 export async function getProjectPlan(
   projectId: string
-): Promise<{ plan_md: string }> {
+): Promise<{ plan_md: string | null }> {
   return request(`/api/projects/${projectId}/plan`);
 }
 
@@ -87,35 +120,32 @@ export async function updateProjectPlan(
   });
 }
 
-// ── Chat History ──────────────────────────────────────────
 export async function getChatHistory(
   projectId: string
 ): Promise<ChatMessage[]> {
-  return request(`/api/projects/${projectId}/history`);
+  const messages = await request<any[]>(`/api/projects/${projectId}/chat-history`);
+  return messages.map(mapChatMessage);
 }
 
-// ── Logs ──────────────────────────────────────────────────
 export async function getProjectLogs(
   projectId: string
-): Promise<TaskLog[]> {
-  return request(`/api/projects/${projectId}/logs`);
+): Promise<BuilderLog[]> {
+  const logs = await request<any[]>(`/api/projects/${projectId}/logs`);
+  return logs.map(mapBuilderLog);
 }
 
-// ── Sessions ──────────────────────────────────────────────
 export async function getProjectSessions(
   projectId: string
 ): Promise<Session[]> {
   return request(`/api/projects/${projectId}/sessions`);
 }
 
-// ── Preview ───────────────────────────────────────────────
 export async function getPreviewUrl(
   projectId: string
-): Promise<{ url: string | null }> {
+): Promise<{ preview_url: string | null }> {
   return request(`/api/projects/${projectId}/preview-url`);
 }
 
-// ── Rollback ──────────────────────────────────────────────
 export async function rollbackProject(
   projectId: string,
   checkpointId: string
@@ -124,4 +154,18 @@ export async function rollbackProject(
     method: "POST",
     body: JSON.stringify({ checkpoint_id: checkpointId }),
   });
+}
+
+export async function updateDeployTarget(
+  projectId: string,
+  target: DeployTargetRequest
+): Promise<{ status: string }> {
+  return request(`/api/projects/${projectId}/deploy-target`, {
+    method: "PUT",
+    body: JSON.stringify(target),
+  });
+}
+
+export async function getDeployRuns(projectId: string): Promise<DeployRun[]> {
+  return request(`/api/projects/${projectId}/deploy-runs`);
 }

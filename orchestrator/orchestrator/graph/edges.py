@@ -9,62 +9,36 @@ from orchestrator.graph.state import AutomatronState
 
 logger = logging.getLogger(__name__)
 
-# Maximum escalations per task before freezing
 MAX_ESCALATIONS = 2
 
 
-def route_after_task_selector(
-    state: AutomatronState,
-) -> Literal["builder", "completion"]:
-    """Route after task_selector: if tasks remain → builder, else → completion."""
+def route_after_plan_review(state: AutomatronState) -> Literal["repo_prepare", "architect"]:
+    if state.get("container_id"):
+        logger.info("Plan review resume after freeze -> architect")
+        return "architect"
+    logger.info("Initial plan review approved -> repo_prepare")
+    return "repo_prepare"
+
+
+def route_after_task_selector(state: AutomatronState) -> Literal["builder", "preview_check"]:
     if state["current_task_index"] < 0:
-        logger.info("All tasks completed — routing to completion")
-        return "completion"
-    logger.info(
-        "Task %d selected — routing to builder",
-        state["current_task_index"],
-    )
+        logger.info("All tasks completed -> preview_check")
+        return "preview_check"
+    logger.info("Task %d selected -> builder", state["current_task_index"])
     return "builder"
 
 
 def route_after_status_classifier(
     state: AutomatronState,
 ) -> Literal["task_selector", "freeze", "architect"]:
-    """Route after status_classifier based on builder status.
-
-    - SUCCESS / SILENT_DECISION → next task (task_selector)
-    - BLOCKER / AMBIGUITY → check escalation count
-      - if count > MAX_ESCALATIONS → freeze (anti-loop)
-      - else → architect (re-plan)
-    """
     status = state["builder_status"]
 
     if status in ("SUCCESS", "SILENT_DECISION"):
-        logger.info("Builder status %s — moving to next task", status)
         return "task_selector"
 
-    # BLOCKER or AMBIGUITY
     escalation_count = state.get("escalation_count", 0)
-    logger.warning(
-        "Builder status %s (escalation #%d for task %d)",
-        status,
-        escalation_count,
-        state["current_task_index"],
-    )
-
     if escalation_count >= MAX_ESCALATIONS:
-        logger.error(
-            "Anti-Loop triggered: task %d failed %d times — freezing",
-            state["current_task_index"],
-            escalation_count + 1,
-        )
+        logger.error("Task %d exceeded escalation limit", state["current_task_index"])
         return "freeze"
 
     return "architect"
-
-
-def route_after_escalation_check(
-    state: AutomatronState,
-) -> Literal["human_review"]:
-    """Route after freeze node — always goes to human_review for manual intervention."""
-    return "human_review"
