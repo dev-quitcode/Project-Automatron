@@ -48,6 +48,19 @@ def test_route_status_silent_decision_to_task_selector():
     )
 
 
+def test_route_status_repairable_failure_to_builder_retry():
+    assert (
+        route_after_status_classifier(
+            _make_state(
+                builder_status="BLOCKER",
+                active_task_id="task-001",
+                task_validation_result={"repairable": True, "escalate": False},
+            )
+        )
+        == "builder"
+    )
+
+
 def test_route_status_blocker_to_architect_before_freeze_limit():
     assert (
         route_after_status_classifier(

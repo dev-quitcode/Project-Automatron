@@ -6,13 +6,15 @@ import io
 import logging
 import shlex
 import tarfile
-from pathlib import Path
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 import docker
 from docker.errors import DockerException, NotFound
 
 from orchestrator.config import settings
+from orchestrator.validation.runtime import PreviewRuntimeSpec, resolve_preview_runtime_spec
 
 logger = logging.getLogger(__name__)
 
@@ -335,38 +337,47 @@ class ContainerManager:
         external_port: int,
         stack_config: dict,
         workspace_path: Path,
-    ) -> None:
-        command = self._infer_preview_command(
-            internal_port=internal_port,
-            stack_config=stack_config,
-            workspace_path=workspace_path,
-        )
+        restart_reason: str = "preview_check",
+        runtime_spec: PreviewRuntimeSpec | None = None,
+    ) -> dict[str, str]:
+        spec = runtime_spec or resolve_preview_runtime_spec(workspace_path, stack_config)
+        command = f"{spec.install_command} && {spec.render_preview_command(internal_port)}"
+        cleanup_command = self._preview_cleanup_command(spec)
         wrapped_command = (
-            "if [ -f /tmp/automatron-preview.pid ]; then "
-            "kill $(cat /tmp/automatron-preview.pid) >/dev/null 2>&1 || true; "
-            "fi; "
-            f"nohup bash -lc {self._quote_for_bash(command)} "
+            f"{cleanup_command} "
+            f"&& nohup bash -lc {self._quote_for_bash(command)} "
             "> /tmp/automatron-preview.log 2>&1 & echo $! > /tmp/automatron-preview.pid"
         )
         await self.exec_in_container(container_id, wrapped_command, timeout=20)
+        pid = (await self.read_file_from_container(container_id, "/tmp/automatron-preview.pid")).strip()
+        metadata = {
+            "pid": pid,
+            "command": command,
+            "started_at": _now(),
+            "restart_reason": restart_reason,
+            "probe_url": spec.probe_url(internal_port),
+            "runtime_stack": spec.stack,
+        }
         logger.info(
             "Started preview process for %s on %d (host %d)",
             container_id[:12],
             internal_port,
             external_port,
         )
+        return metadata
 
     async def wait_for_preview(
         self,
         container_id: str,
         *,
         internal_port: int,
+        probe_path: str = "/",
         attempts: int = 20,
         delay_seconds: int = 2,
     ) -> None:
         check_command = (
             f"for i in $(seq 1 {attempts}); do "
-            f"curl -fsS http://127.0.0.1:{internal_port}/ >/dev/null && exit 0; "
+            f"curl -fsS http://127.0.0.1:{internal_port}{probe_path} >/dev/null && exit 0; "
             f"sleep {delay_seconds}; "
             "done; "
             "echo 'Preview server failed to respond'; "
@@ -376,39 +387,24 @@ class ContainerManager:
         if result.exit_code != 0:
             raise RuntimeError(result.output)
 
-    def _infer_preview_command(
-        self,
-        *,
-        internal_port: int,
-        stack_config: dict,
-        workspace_path: Path,
-    ) -> str:
-        if (workspace_path / "next.config.js").exists() or (workspace_path / "next.config.ts").exists():
-            package_manager = "pnpm" if (workspace_path / "pnpm-lock.yaml").exists() else "npm"
-            install_cmd = "pnpm install" if package_manager == "pnpm" else "npm install"
-            dev_cmd = (
-                f"{package_manager} run dev -- --hostname 0.0.0.0 --port {internal_port}"
-                if package_manager == "pnpm"
-                else f"npm run dev -- --hostname 0.0.0.0 --port {internal_port}"
-            )
-            return f"{install_cmd} && {dev_cmd}"
-
-        if (workspace_path / "vite.config.ts").exists() or (workspace_path / "vite.config.js").exists():
-            package_manager = "pnpm" if (workspace_path / "pnpm-lock.yaml").exists() else "npm"
-            install_cmd = "pnpm install" if package_manager == "pnpm" else "npm install"
-            dev_cmd = (
-                f"{package_manager} run dev -- --host 0.0.0.0 --port {internal_port}"
-                if package_manager == "pnpm"
-                else f"npm run dev -- --host 0.0.0.0 --port {internal_port}"
-            )
-            return f"{install_cmd} && {dev_cmd}"
-
-        if (workspace_path / "pyproject.toml").exists() or (workspace_path / "requirements.txt").exists():
-            return f"python -m http.server {internal_port} --bind 0.0.0.0"
-
-        return f"python -m http.server {internal_port} --bind 0.0.0.0"
-
     @staticmethod
     def _quote_for_bash(command: str) -> str:
         escaped = command.replace("\\", "\\\\").replace("\"", "\\\"")
         return f'"{escaped}"'
+
+    @staticmethod
+    def _preview_cleanup_command(runtime_spec: PreviewRuntimeSpec) -> str:
+        cache_cleanup = " ".join(f"rm -rf /workspace/{cache_dir};" for cache_dir in runtime_spec.cache_dirs)
+        return (
+            "if [ -f /tmp/automatron-preview.pid ]; then "
+            "PID=$(cat /tmp/automatron-preview.pid); "
+            "kill \"$PID\" >/dev/null 2>&1 || true; "
+            "wait \"$PID\" >/dev/null 2>&1 || true; "
+            "fi; "
+            "rm -f /tmp/automatron-preview.pid /tmp/automatron-preview.log; "
+            f"{cache_cleanup}"
+        )
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()

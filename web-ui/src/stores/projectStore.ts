@@ -65,6 +65,7 @@ interface ProjectState {
   fetchPlan: (projectId: string) => Promise<void>;
   updatePlan: (projectId: string, planMd: string) => Promise<void>;
   updateProjectLlmConfig: (projectId: string, llmConfig: ProjectLlmConfig) => Promise<void>;
+  restartPreview: (id: string) => Promise<void>;
   updateDeployTarget: (
     projectId: string,
     target: DeployTargetRequest
@@ -362,6 +363,23 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       }));
     } catch (error: any) {
       set({ error: error.message });
+    }
+  },
+
+  restartPreview: async (id) => {
+    set({ error: null });
+    try {
+      const project = await api.restartProjectPreview(id);
+      set((state) => ({
+        projects: state.projects.map((item) =>
+          item.id === project.id ? project : item
+        ),
+        currentProject:
+          state.currentProject?.id === project.id ? project : state.currentProject,
+      }));
+    } catch (error: any) {
+      set({ error: error.message });
+      throw error;
     }
   },
 

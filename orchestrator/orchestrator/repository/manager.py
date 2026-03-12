@@ -14,6 +14,7 @@ import httpx
 
 from orchestrator.config import settings
 from orchestrator.github_actions.manager import GitHubActionsManager
+from orchestrator.validation.workspace import StackValidatorResult, validate_workspace_contract
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,9 @@ class RepositoryManager:
             response.raise_for_status()
             return response.json()
 
+    async def get_remote_repository(self, repo_name: str) -> dict[str, Any] | None:
+        return await self._get_repository(repo_name)
+
     def initialize_workspace_repository(
         self,
         project_id: str,
@@ -227,17 +231,20 @@ class RepositoryManager:
         self._git(workspace, ["checkout", source_branch], check=False)
         return sha
 
-    def validate_deploy_artifacts(self, project_id: str) -> list[str]:
+    def validate_deploy_artifacts(
+        self,
+        project_id: str,
+        *,
+        stack_config: dict[str, Any] | None = None,
+        container_manager: Any | None = None,
+        container_id: str | None = None,
+        require_heavy_checks: bool = False,
+    ) -> StackValidatorResult:
         workspace = self.workspace_path(project_id)
-        required = [
-            workspace / "Dockerfile",
-            workspace / ".env.example",
-            workspace / "deploy" / "docker-compose.yml",
-            workspace / "DEPLOY.md",
-            workspace / ".github" / "workflows" / "ci.yml",
-            workspace / ".github" / "workflows" / "deploy.yml",
-        ]
-        return [str(path.relative_to(workspace)) for path in required if not path.exists()]
+        return validate_workspace_contract(
+            workspace,
+            stack_config=stack_config,
+        )
 
     def ensure_deploy_supporting_docs(self, project_id: str, project_name: str) -> None:
         workspace = self.workspace_path(project_id)

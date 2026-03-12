@@ -8,6 +8,7 @@ import time
 
 from orchestrator.config import settings
 from orchestrator.docker_engine.manager import ContainerManager
+from orchestrator.execution_contract import normalize_execution_contract
 from orchestrator.graph.state import AutomatronState
 from orchestrator.llm.configuration import default_llm_config, normalize_llm_config
 from orchestrator.plan_parser.parser import get_global_rules
@@ -49,6 +50,12 @@ async def builder_node(state: AutomatronState) -> dict:
     rules_text = "\n".join(f"- {rule}" for rule in global_rules) if global_rules else "- None"
     stack_config = state.get("stack_config", {})
     preview_port = state.get("container_port", 3000)
+    execution_contract = normalize_execution_contract(state.get("execution_contract") or {})
+    active_task_id = state.get("active_task_id", f"task-{task_index + 1:03d}")
+    task_contract = next(
+        (task for task in execution_contract.get("task_graph", []) if task.get("task_id") == active_task_id),
+        {},
+    )
     preview_requirement = (
         "By the end of the plan, the repo must contain Dockerfile, .env.example, "
         "deploy/docker-compose.yml, DEPLOY.md, .github/workflows/ci.yml, "
@@ -59,9 +66,13 @@ async def builder_node(state: AutomatronState) -> dict:
         "You are Automatron Builder operating inside the project workspace.\n\n"
         f"PROJECT NAME:\n{project_name}\n\n"
         f"PROJECT INTAKE:\n{intake_text}\n\n"
+        f"TASK ID:\n{active_task_id}\n\n"
         f"CURRENT TASK:\n{task_text}\n\n"
+        f"TASK CONTRACT:\n{task_contract}\n\n"
         f"STACK CONFIG:\n{stack_config}\n\n"
         f"GLOBAL RULES:\n{rules_text}\n\n"
+        f"CURRENT TASK ATTEMPT:\n{state.get('task_attempt_count', 0)}\n\n"
+        f"LAST VALIDATION RESULT:\n{state.get('task_validation_result', {})}\n\n"
         "REQUIRED OUTPUT CONTRACT:\n"
         f"- {preview_requirement}\n"
         f"- The active preview port is {preview_port}\n"
@@ -137,12 +148,37 @@ async def builder_node(state: AutomatronState) -> dict:
     except Exception as exc:
         logger.warning("Could not read PLAN.md after task %d: %s", task_index, exc)
 
+    touched_files: list[str] = []
+    try:
+        touched_result = await container_manager.exec_in_container(
+            container_id,
+            "cd /workspace && git status --porcelain --untracked-files=all",
+            timeout=20,
+        )
+        if touched_result.exit_code == 0:
+            touched_files = [
+                line[3:].strip()
+                for line in touched_result.output.splitlines()
+                if len(line) > 3
+            ]
+    except Exception as exc:
+        logger.warning("Could not read touched files after task %d: %s", task_index, exc)
+
     return {
         "builder_output": output,
         "builder_error_detail": "" if exit_code == 0 else output[-2000:],
         "builder_exit_code": exit_code,
         "builder_duration_s": time.monotonic() - started,
         "plan_md": updated_plan,
+        "builder_report": {
+            "task_id": active_task_id,
+            "status": "completed" if exit_code == 0 else "failed",
+            "commands_run": [command],
+            "files_touched": touched_files,
+            "validation_summary": {},
+            "issues": [],
+            "needs_escalation": False,
+        },
         "project_stage": "building",
         "status": "building",
     }

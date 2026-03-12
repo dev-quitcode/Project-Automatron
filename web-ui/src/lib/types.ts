@@ -77,6 +77,7 @@ export interface Project {
   port: number | null;
   preview_url: string | null;
   preview_status: string | null;
+  preview_metadata: Record<string, unknown>;
   ci_status: string;
   ci_run_id: string | null;
   ci_run_url: string | null;
@@ -212,4 +213,18 @@ export interface DeployTargetRequest {
   env_content?: string;
   app_url?: string;
   health_path?: string;
+}
+
+export interface PreflightCheck {
+  code: string;
+  status: "ok" | "warning" | "blocking";
+  message: string;
+  details: Record<string, unknown>;
+}
+
+export interface PreflightResult {
+  phase: "start" | "deploy";
+  ok: boolean;
+  blocking: boolean;
+  checks: PreflightCheck[];
 }

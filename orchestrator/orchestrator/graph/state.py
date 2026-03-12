@@ -15,6 +15,8 @@ ProjectStage = Literal[
     "repo_preparing",
     "scaffolding",
     "building",
+    "validating",
+    "awaiting_architect_delta",
     "awaiting_preview_approval",
     "ready_for_deploy",
     "deploying",
@@ -27,6 +29,7 @@ ProjectStatus = Literal[
     "pending",
     "planning",
     "building",
+    "validating",
     "preview",
     "ready_for_deploy",
     "deploying",
@@ -70,11 +73,20 @@ class AutomatronState(TypedDict, total=False):
     plan_md: str
     stack_config: dict
     llm_config: dict[str, LlmRoleConfig]
+    execution_contract: dict
+    contract_version: int
+    decision_log: list[dict]
+    plan_delta_history: list[dict]
 
     current_task_index: int
+    active_task_id: str
     current_task_text: str
     total_tasks: int
     completed_tasks: int
+    task_attempt_count: int
+    task_validation_result: dict
+    last_escalation: dict
+    builder_report: dict
 
     messages: Annotated[list[AnyMessage], add_messages]
 

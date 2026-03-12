@@ -13,8 +13,11 @@ from orchestrator.graph.runner import (
     _make_thread_config,
     deploy_project as runner_deploy,
     get_checkpoints,
+    get_task_status as runner_get_task_status,
     is_running,
+    restart_preview as runner_restart_preview,
     resume_project as runner_resume,
+    run_preflight as runner_preflight,
     sync_cicd_status as runner_sync_cicd,
     start_project as runner_start,
     stop_project as runner_stop,
@@ -22,6 +25,7 @@ from orchestrator.graph.runner import (
 from orchestrator.llm.catalog import get_all_provider_model_catalogs, get_provider_model_catalog
 from orchestrator.llm.configuration import default_llm_config, normalize_llm_config
 from orchestrator.repository.manager import RepositoryManager
+from orchestrator.validation.preflight import PreflightService
 from orchestrator.models.project import (
     create_project,
     get_all_projects,
@@ -40,6 +44,7 @@ from orchestrator.models.session import get_sessions
 
 router = APIRouter()
 repository_manager = RepositoryManager()
+preflight_service = PreflightService(repository_manager=repository_manager)
 
 
 class RoleLlmConfig(BaseModel):
@@ -101,6 +106,10 @@ class ProjectResponse(BaseModel):
     plan_md: str | None
     stack_config: dict[str, Any] = Field(default_factory=dict)
     llm_config: dict[str, Any] = Field(default_factory=default_llm_config)
+    execution_contract: dict[str, Any] = Field(default_factory=dict)
+    contract_version: int = 0
+    decision_log: list[dict[str, Any]] = Field(default_factory=list)
+    plan_delta_history: list[dict[str, Any]] = Field(default_factory=list)
     repo_name: str | None
     repo_url: str | None
     repo_clone_url: str | None
@@ -112,6 +121,7 @@ class ProjectResponse(BaseModel):
     port: int | None
     preview_url: str | None
     preview_status: str | None
+    preview_metadata: dict[str, Any] = Field(default_factory=dict)
     ci_status: str
     ci_run_id: str | None
     ci_run_url: str | None
@@ -123,6 +133,11 @@ class ProjectResponse(BaseModel):
     deploy_target_summary: dict[str, Any] | None
     plan_approved: bool = False
     preview_approved: bool = False
+    active_task_id: str | None = None
+    task_attempt_count: int = 0
+    task_validation_result: dict[str, Any] = Field(default_factory=dict)
+    last_escalation: dict[str, Any] = Field(default_factory=dict)
+    builder_report: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str
 
@@ -139,6 +154,49 @@ class ProviderModelCatalogResponse(BaseModel):
     fetched_at: str | None = None
     error: str | None = None
     cached: bool = False
+
+
+class PreflightRequest(BaseModel):
+    phase: Literal["start", "deploy"]
+
+
+class PreflightCheckResponse(BaseModel):
+    code: str
+    status: Literal["ok", "warning", "blocking"]
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class PreflightResponse(BaseModel):
+    phase: Literal["start", "deploy"]
+    ok: bool
+    blocking: bool
+    checks: list[PreflightCheckResponse] = Field(default_factory=list)
+
+
+class ExecutionContractResponse(BaseModel):
+    project_id: str
+    contract_version: int = 0
+    execution_contract: dict[str, Any] = Field(default_factory=dict)
+
+
+class DecisionLogResponse(BaseModel):
+    project_id: str
+    contract_version: int = 0
+    decision_log: list[dict[str, Any]] = Field(default_factory=list)
+    plan_delta_history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TaskStatusResponse(BaseModel):
+    project_id: str
+    active_task_id: str | None = None
+    active_task: dict[str, Any] | None = None
+    completed_tasks: int = 0
+    total_tasks: int = 0
+    task_attempt_count: int = 0
+    task_validation_result: dict[str, Any] = Field(default_factory=dict)
+    builder_report: dict[str, Any] = Field(default_factory=dict)
+    last_escalation: dict[str, Any] = Field(default_factory=dict)
 
 
 async def _get_required_project(project_id: str) -> dict[str, Any]:
@@ -188,6 +246,33 @@ async def api_get_project(project_id: str) -> Any:
     return await _get_required_project(project_id)
 
 
+@router.get("/projects/{project_id}/execution-contract", response_model=ExecutionContractResponse)
+async def api_get_execution_contract(project_id: str) -> Any:
+    project = await _get_required_project(project_id)
+    return {
+        "project_id": project_id,
+        "contract_version": int(project.get("contract_version", 0) or 0),
+        "execution_contract": project.get("execution_contract") or {},
+    }
+
+
+@router.get("/projects/{project_id}/decision-log", response_model=DecisionLogResponse)
+async def api_get_decision_log(project_id: str) -> Any:
+    project = await _get_required_project(project_id)
+    return {
+        "project_id": project_id,
+        "contract_version": int(project.get("contract_version", 0) or 0),
+        "decision_log": project.get("decision_log") or [],
+        "plan_delta_history": project.get("plan_delta_history") or [],
+    }
+
+
+@router.get("/projects/{project_id}/task-status", response_model=TaskStatusResponse)
+async def api_get_task_status(project_id: str) -> Any:
+    await _get_required_project(project_id)
+    return await runner_get_task_status(project_id)
+
+
 @router.delete("/projects/{project_id}")
 async def api_delete_project(project_id: str) -> dict[str, str]:
     await _get_required_project(project_id)
@@ -218,9 +303,11 @@ async def api_get_plan(project_id: str) -> dict[str, str | None]:
 
 
 @router.post("/projects/{project_id}/start")
-async def api_start_project(project_id: str) -> dict[str, str]:
+async def api_start_project(project_id: str) -> Any:
     await _get_required_project(project_id)
-    return await runner_start(project_id)
+    result = await runner_start(project_id)
+    _raise_for_preflight_failure(result)
+    return result
 
 
 @router.post("/projects/{project_id}/approve-plan")
@@ -249,9 +336,27 @@ async def api_stop_project(project_id: str) -> dict[str, str]:
 @router.put("/projects/{project_id}/deploy-target")
 async def api_update_deploy_target(project_id: str, req: DeployTargetRequest) -> dict[str, str]:
     project = await _get_required_project(project_id)
-    deploy_target = req.model_dump()
-    if not str(deploy_target.get("health_path", "") or "").strip():
-        deploy_target["health_path"] = "/api/health"
+    deploy_target = preflight_service.normalize_deploy_target(req.model_dump())
+    target_checks = preflight_service.validate_deploy_target_shape(deploy_target)
+    blocking_checks = [check for check in target_checks if check.status == "blocking"]
+    if blocking_checks:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "phase": "deploy",
+                "ok": False,
+                "blocking": True,
+                "checks": [
+                    {
+                        "code": check.code,
+                        "status": check.status,
+                        "message": check.message,
+                        "details": check.details,
+                    }
+                    for check in target_checks
+                ],
+            },
+        )
     if project.get("repo_name"):
         await repository_manager.configure_remote_cicd_for_target(project["repo_name"], deploy_target)
     await update_project_deploy_target(project_id, deploy_target)
@@ -259,9 +364,26 @@ async def api_update_deploy_target(project_id: str, req: DeployTargetRequest) ->
 
 
 @router.post("/projects/{project_id}/deploy")
-async def api_deploy_project(project_id: str) -> dict[str, str]:
+async def api_deploy_project(project_id: str) -> Any:
     await _get_required_project(project_id)
-    return await runner_deploy(project_id)
+    result = await runner_deploy(project_id)
+    _raise_for_preflight_failure(result)
+    return result
+
+
+@router.post("/projects/{project_id}/preflight", response_model=PreflightResponse)
+async def api_preflight_project(project_id: str, req: PreflightRequest) -> Any:
+    await _get_required_project(project_id)
+    return await runner_preflight(project_id, req.phase)
+
+
+@router.post("/projects/{project_id}/preview/restart", response_model=ProjectResponse)
+async def api_restart_preview(project_id: str) -> Any:
+    await _get_required_project(project_id)
+    result = await runner_restart_preview(project_id)
+    if result.get("status") not in {"restarted"}:
+        raise HTTPException(status_code=409, detail=result)
+    return await _get_required_project(project_id)
 
 
 @router.post("/projects/{project_id}/sync-cicd", response_model=ProjectResponse)
@@ -335,3 +457,8 @@ async def api_get_preview_url(project_id: str) -> dict[str, str | None]:
 async def api_get_project_deploy_runs(project_id: str) -> list[dict[str, Any]]:
     await _get_required_project(project_id)
     return await get_deploy_runs(project_id)
+
+
+def _raise_for_preflight_failure(result: dict[str, Any]) -> None:
+    if result.get("status") == "preflight_failed":
+        raise HTTPException(status_code=409, detail=result.get("preflight", {}))

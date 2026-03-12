@@ -5,6 +5,7 @@ import type {
   DeployTargetRequest,
   LlmProvider,
   ProviderModelCatalog,
+  PreflightResult,
   Project,
   ProjectCreateRequest,
   Session,
@@ -68,6 +69,16 @@ export async function syncProjectCicd(id: string): Promise<Project> {
   });
 }
 
+export async function runProjectPreflight(
+  projectId: string,
+  phase: "start" | "deploy"
+): Promise<PreflightResult> {
+  return request(`/api/projects/${projectId}/preflight`, {
+    method: "POST",
+    body: JSON.stringify({ phase }),
+  });
+}
+
 export async function createProject(data: ProjectCreateRequest): Promise<Project> {
   return request("/api/projects", {
     method: "POST",
@@ -111,6 +122,12 @@ export async function deployProject(
   projectId: string
 ): Promise<{ status: string }> {
   return request(`/api/projects/${projectId}/deploy`, {
+    method: "POST",
+  });
+}
+
+export async function restartProjectPreview(projectId: string): Promise<Project> {
+  return request(`/api/projects/${projectId}/preview/restart`, {
     method: "POST",
   });
 }

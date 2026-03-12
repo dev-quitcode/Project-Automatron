@@ -16,7 +16,7 @@ def mark_task_complete(content: str, task_index: int) -> str:
         Updated PLAN.md content with the task marked [x]
     """
     lines = content.split("\n")
-    checkbox_pattern = re.compile(r"^(\s*-\s*)\[[ ]\](\s*\*\*.+?\*\*.*)")
+    checkbox_pattern = re.compile(r"^(\s*-\s*)\[[ xX]\](\s*\*\*.+?\*\*.*)")
     current_index = 0
 
     for i, line in enumerate(lines):

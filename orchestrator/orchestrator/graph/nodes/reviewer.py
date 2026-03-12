@@ -5,11 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from orchestrator.api.websocket import emit_builder_log
+from orchestrator.docker_engine.manager import ContainerManager
+from orchestrator.execution_contract import (
+    mark_contract_task_completed,
+    normalize_execution_contract,
+    update_contract_task_attempt,
+)
 from orchestrator.graph.state import AutomatronState
 from orchestrator.llm.configuration import default_llm_config, normalize_llm_config
 from orchestrator.llm.prompts import load_prompt
@@ -17,10 +22,15 @@ from orchestrator.llm.provider import call_llm
 from orchestrator.models.project import save_task_log
 from orchestrator.plan_parser.parser import mark_task_completed
 from orchestrator.repository.manager import RepositoryManager
+from orchestrator.validation.workspace import (
+    should_run_heavy_task_checks,
+    validate_workspace_contract_async,
+)
 
 logger = logging.getLogger(__name__)
 
 repository_manager = RepositoryManager()
+container_manager = ContainerManager()
 
 
 async def status_classifier_node(state: AutomatronState) -> dict:
@@ -28,10 +38,14 @@ async def status_classifier_node(state: AutomatronState) -> dict:
     builder_error = state.get("builder_error_detail", "")
     task_text = state.get("current_task_text", "")
     task_index = state.get("current_task_index", -1)
+    task_id = state.get("active_task_id", f"task-{task_index + 1:03d}")
     session_id = state.get("session_id", "")
     llm_config = normalize_llm_config(state.get("llm_config") or default_llm_config())
     reviewer_model = llm_config["reviewer"]["model"]
     plan_md = state.get("plan_md", "")
+    execution_contract = normalize_execution_contract(state.get("execution_contract") or {})
+    current_attempt = int(state.get("task_attempt_count", 0) or 0)
+    max_self_retries = int(execution_contract.get("escalation_policy", {}).get("self_retries", 2) or 2)
 
     if not builder_error and _looks_successful(builder_output):
         status = "SUCCESS"
@@ -61,11 +75,83 @@ async def status_classifier_node(state: AutomatronState) -> dict:
             reason = f"Classification failed: {exc}"
 
     updated_plan = plan_md
+    updated_contract = execution_contract
+    task_validation_result: dict = {
+        "task_id": task_id,
+        "passed": False,
+        "checks": [],
+        "blocking": False,
+        "repairable": False,
+        "escalate": False,
+    }
+    next_attempt_count = current_attempt
+    last_escalation: dict = {}
     if status in ("SUCCESS", "SILENT_DECISION"):
-        validation_issues = _validate_workspace_contract(state)
-        if validation_issues:
-            status = "AMBIGUITY"
-            reason = "; ".join(validation_issues)
+        validation_result = await validate_workspace_contract_async(
+            repository_manager.workspace_path(state["project_id"]),
+            stack_config=state.get("stack_config", {}),
+            container_manager=container_manager,
+            container_id=state.get("container_id") or None,
+            require_heavy_checks=should_run_heavy_task_checks(task_text),
+        )
+        blocking_issues = validation_result.blocking_issues
+        if blocking_issues:
+            task_validation_result = {
+                "task_id": task_id,
+                "passed": False,
+                "checks": [
+                    {
+                        "code": issue.code,
+                        "status": issue.status,
+                        "message": issue.message,
+                        "details": issue.details,
+                    }
+                    for issue in validation_result.issues
+                ],
+                "blocking": True,
+                "repairable": _issues_repairable(blocking_issues),
+                "escalate": False,
+            }
+            status = (
+                "BLOCKER"
+                if any(issue.status == "blocker" for issue in blocking_issues)
+                else "AMBIGUITY"
+            )
+            reason = "; ".join(issue.message for issue in blocking_issues)
+            next_attempt_count = current_attempt + 1
+            if task_validation_result["repairable"] and next_attempt_count <= max_self_retries:
+                updated_contract = update_contract_task_attempt(
+                    execution_contract,
+                    task_id,
+                    next_attempt_count,
+                    status="retrying",
+                )
+            else:
+                task_validation_result["escalate"] = True
+                last_escalation = _build_escalation_request(
+                    state,
+                    task_id=task_id,
+                    task_text=task_text,
+                    reason=reason,
+                    validation_result=task_validation_result,
+                    attempts_made=next_attempt_count,
+                )
+                updated_contract = update_contract_task_attempt(
+                    execution_contract,
+                    task_id,
+                    next_attempt_count,
+                    status="blocked",
+                )
+        else:
+            task_validation_result = {
+                "task_id": task_id,
+                "passed": True,
+                "checks": [],
+                "blocking": False,
+                "repairable": False,
+                "escalate": False,
+            }
+            updated_contract = mark_contract_task_completed(execution_contract, task_id)
 
     if status in ("SUCCESS", "SILENT_DECISION"):
         if plan_md:
@@ -84,6 +170,33 @@ async def status_classifier_node(state: AutomatronState) -> dict:
             )
         except Exception as exc:
             logger.warning("Failed to commit task %d changes: %s", task_index, exc)
+    else:
+        next_attempt_count = current_attempt + 1
+        repairable_failure = _reason_is_repairable(reason, builder_output, builder_error)
+        task_validation_result = {
+            **task_validation_result,
+            "task_id": task_id,
+            "passed": False,
+            "checks": task_validation_result.get("checks", []),
+            "blocking": True,
+            "repairable": repairable_failure,
+            "escalate": not (repairable_failure and next_attempt_count <= max_self_retries),
+        }
+        updated_contract = update_contract_task_attempt(
+            updated_contract,
+            task_id,
+            next_attempt_count,
+            status="retrying" if not task_validation_result["escalate"] else "failed",
+        )
+        if task_validation_result["escalate"] and not last_escalation:
+            last_escalation = _build_escalation_request(
+                state,
+                task_id=task_id,
+                task_text=task_text,
+                reason=reason,
+                validation_result=task_validation_result,
+                attempts_made=next_attempt_count,
+            )
 
     if session_id:
         await save_task_log(
@@ -104,12 +217,36 @@ async def status_classifier_node(state: AutomatronState) -> dict:
         status=status,
     )
 
+    builder_report = dict(state.get("builder_report") or {})
+    builder_report.update(
+        {
+            "task_id": task_id,
+            "status": status.lower(),
+            "validation_summary": task_validation_result,
+            "issues": task_validation_result.get("checks", []),
+            "needs_escalation": task_validation_result.get("escalate", False),
+        }
+    )
+
+    needs_self_retry = bool(task_validation_result.get("repairable")) and not task_validation_result.get("escalate")
+    next_stage = (
+        "awaiting_architect_delta"
+        if task_validation_result.get("escalate")
+        else ("building" if needs_self_retry else "validating")
+    )
+    next_status = "building" if task_validation_result.get("escalate") or needs_self_retry else "validating"
+
     return {
         "builder_status": status,
         "builder_error_detail": reason,
         "plan_md": updated_plan,
-        "project_stage": "building",
-        "status": "building",
+        "execution_contract": updated_contract,
+        "task_validation_result": task_validation_result,
+        "task_attempt_count": 0 if status in ("SUCCESS", "SILENT_DECISION") else (next_attempt_count or current_attempt + 1),
+        "last_escalation": last_escalation,
+        "builder_report": builder_report,
+        "project_stage": next_stage,
+        "status": next_status,
     }
 
 
@@ -131,35 +268,62 @@ def _looks_successful(output: str) -> bool:
     return not any(indicator in output_lower for indicator in error_indicators)
 
 
-def _validate_workspace_contract(state: AutomatronState) -> list[str]:
-    stack_text = json.dumps(state.get("stack_config", {}), ensure_ascii=True).lower()
-    if "next" not in stack_text:
-        return []
-
-    workspace = repository_manager.workspace_path(state["project_id"])
-    layout_file = workspace / "app" / "layout.tsx"
-    health_route = workspace / "app" / "api" / "health" / "route.ts"
-
-    issues: list[str] = []
-    if not health_route.exists():
-        issues.append("Missing Next.js health endpoint at app/api/health/route.ts")
-
-    if not layout_file.exists():
-        issues.append("Missing app/layout.tsx")
-        return issues
-
-    layout_text = _safe_read_text(layout_file)
-    if "Create Next App" in layout_text or "Generated by create next app" in layout_text:
-        issues.append("Default Next.js metadata is still present in app/layout.tsx")
-    return issues
+def _issues_repairable(issues: list) -> bool:
+    markers = (
+        "build",
+        "compile",
+        "import",
+        "prisma",
+        "artifact",
+        "health",
+        "metadata",
+        "workflow",
+        "compose",
+    )
+    return all(any(marker in issue.code for marker in markers) for issue in issues)
 
 
-def _safe_read_text(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
+def _reason_is_repairable(reason: str, builder_output: str, builder_error: str) -> bool:
+    haystack = f"{reason}\n{builder_output}\n{builder_error}".lower()
+    markers = (
+        "build",
+        "compile",
+        "import",
+        "type error",
+        "lint",
+        "prisma",
+        "artifact",
+        "health",
+        "metadata",
+        "workflow",
+        "compose",
+        "module not found",
+        "cannot find module",
+    )
+    return any(marker in haystack for marker in markers)
 
+
+def _build_escalation_request(
+    state: AutomatronState,
+    *,
+    task_id: str,
+    task_text: str,
+    reason: str,
+    validation_result: dict,
+    attempts_made: int,
+) -> dict:
+    builder_report = state.get("builder_report") or {}
+    return {
+        "task_id": task_id,
+        "problem_type": state.get("builder_status") or "BLOCKER",
+        "observed_error": reason,
+        "commands_run": list(builder_report.get("commands_run", [])),
+        "files_touched": list(builder_report.get("files_touched", [])),
+        "attempts_made": attempts_made,
+        "task_text": task_text,
+        "validation_result": validation_result,
+        "recommended_option": "Return a targeted architect plan delta for this task.",
+    }
 
 def _parse_classification(response: str) -> dict[str, str]:
     try:

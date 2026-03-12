@@ -62,6 +62,15 @@ class GitHubActionsManager:
             json={},
         )
 
+    async def get_environment_public_key(
+        self,
+        repo_name: str,
+        *,
+        environment_name: str | None = None,
+    ) -> dict[str, str]:
+        environment = environment_name or settings.github_environment_name
+        return await self._get_environment_public_key(repo_name, environment)
+
     async def upsert_environment_secrets(
         self,
         repo_name: str,

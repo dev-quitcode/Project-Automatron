@@ -12,10 +12,10 @@ logger = logging.getLogger(__name__)
 MAX_ESCALATIONS = 2
 
 
-def route_after_plan_review(state: AutomatronState) -> Literal["repo_prepare", "task_selector"]:
+def route_after_plan_review(state: AutomatronState) -> Literal["repo_prepare", "architect"]:
     if state.get("container_id"):
-        logger.info("Plan review approved for existing workspace -> task_selector")
-        return "task_selector"
+        logger.info("Plan review approved for existing workspace -> architect")
+        return "architect"
     logger.info("Initial plan review approved -> repo_prepare")
     return "repo_prepare"
 
@@ -30,11 +30,16 @@ def route_after_task_selector(state: AutomatronState) -> Literal["builder", "pre
 
 def route_after_status_classifier(
     state: AutomatronState,
-) -> Literal["task_selector", "freeze", "architect"]:
+) -> Literal["task_selector", "freeze", "architect", "builder"]:
     status = state["builder_status"]
 
     if status in ("SUCCESS", "SILENT_DECISION"):
         return "task_selector"
+
+    task_validation_result = state.get("task_validation_result", {})
+    if task_validation_result.get("repairable") and not task_validation_result.get("escalate"):
+        logger.info("Task %s marked repairable -> builder self-retry", state.get("active_task_id", ""))
+        return "builder"
 
     escalation_count = state.get("escalation_count", 0)
     if escalation_count >= MAX_ESCALATIONS:

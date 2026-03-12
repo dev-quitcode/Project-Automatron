@@ -23,6 +23,12 @@ PROJECT_COLUMN_DEFS: dict[str, str] = {
     "intake_source": "TEXT NOT NULL DEFAULT 'manual'",
     "source_ref": "TEXT",
     "llm_config_json": "TEXT",
+    "execution_contract_json": "TEXT",
+    "decision_log_json": "TEXT",
+    "plan_delta_history_json": "TEXT",
+    "task_validation_result_json": "TEXT",
+    "last_escalation_json": "TEXT",
+    "builder_report_json": "TEXT",
     "repo_name": "TEXT",
     "repo_url": "TEXT",
     "repo_clone_url": "TEXT",
@@ -30,6 +36,9 @@ PROJECT_COLUMN_DEFS: dict[str, str] = {
     "develop_branch": "TEXT",
     "feature_branch": "TEXT",
     "repo_ready": "INTEGER NOT NULL DEFAULT 0",
+    "contract_version": "INTEGER NOT NULL DEFAULT 0",
+    "active_task_id": "TEXT",
+    "task_attempt_count": "INTEGER NOT NULL DEFAULT 0",
     "preview_url": "TEXT",
     "preview_status": "TEXT NOT NULL DEFAULT 'pending'",
     "preview_checked_at": "TEXT",
@@ -55,6 +64,12 @@ PROJECT_COLUMN_DEFS: dict[str, str] = {
 JSON_FIELDS = {
     "stack_config_json",
     "llm_config_json",
+    "execution_contract_json",
+    "decision_log_json",
+    "plan_delta_history_json",
+    "task_validation_result_json",
+    "last_escalation_json",
+    "builder_report_json",
     "deploy_target_json",
     "preview_metadata_json",
     "approval_history_json",
@@ -63,6 +78,12 @@ BOOL_FIELDS = {"repo_ready", "plan_approved", "preview_approved"}
 JSON_FIELD_DEFAULTS: dict[str, Any] = {
     "stack_config_json": {},
     "llm_config_json": default_llm_config(),
+    "execution_contract_json": {},
+    "decision_log_json": [],
+    "plan_delta_history_json": [],
+    "task_validation_result_json": {},
+    "last_escalation_json": {},
+    "builder_report_json": {},
     "deploy_target_json": {},
     "preview_metadata_json": {},
     "approval_history_json": [],
@@ -108,6 +129,12 @@ def _serialize_project_row(row: aiosqlite.Row) -> dict[str, Any]:
     project["deploy_target_summary"] = _summarize_deploy_target(deploy_target)
     project["stack_config"] = project.get("stack_config_json") or {}
     project["llm_config"] = normalize_llm_config(project.get("llm_config_json") or {})
+    project["execution_contract"] = project.get("execution_contract_json") or {}
+    project["decision_log"] = project.get("decision_log_json") or []
+    project["plan_delta_history"] = project.get("plan_delta_history_json") or []
+    project["task_validation_result"] = project.get("task_validation_result_json") or {}
+    project["last_escalation"] = project.get("last_escalation_json") or {}
+    project["builder_report"] = project.get("builder_report_json") or {}
     project["preview_metadata"] = project.get("preview_metadata_json") or {}
     project["approval_history"] = project.get("approval_history_json") or []
     project["description"] = project.get("intake_text", "")
@@ -167,6 +194,12 @@ async def init_db(db_path: str) -> None:
                 plan_md TEXT,
                 stack_config_json TEXT,
                 llm_config_json TEXT,
+                execution_contract_json TEXT,
+                decision_log_json TEXT,
+                plan_delta_history_json TEXT,
+                task_validation_result_json TEXT,
+                last_escalation_json TEXT,
+                builder_report_json TEXT,
                 repo_name TEXT,
                 repo_url TEXT,
                 repo_clone_url TEXT,
@@ -174,6 +207,9 @@ async def init_db(db_path: str) -> None:
                 develop_branch TEXT,
                 feature_branch TEXT,
                 repo_ready INTEGER NOT NULL DEFAULT 0,
+                contract_version INTEGER NOT NULL DEFAULT 0,
+                active_task_id TEXT,
+                task_attempt_count INTEGER NOT NULL DEFAULT 0,
                 container_id TEXT,
                 port INTEGER,
                 preview_url TEXT,
@@ -349,6 +385,18 @@ def _normalize_update_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         normalized["stack_config_json"] = _json_dumps(normalized.pop("stack_config"))
     if "llm_config" in normalized:
         normalized["llm_config_json"] = _json_dumps(normalize_llm_config(normalized.pop("llm_config")))
+    if "execution_contract" in normalized:
+        normalized["execution_contract_json"] = _json_dumps(normalized.pop("execution_contract"))
+    if "decision_log" in normalized:
+        normalized["decision_log_json"] = _json_dumps(normalized.pop("decision_log"))
+    if "plan_delta_history" in normalized:
+        normalized["plan_delta_history_json"] = _json_dumps(normalized.pop("plan_delta_history"))
+    if "task_validation_result" in normalized:
+        normalized["task_validation_result_json"] = _json_dumps(normalized.pop("task_validation_result"))
+    if "last_escalation" in normalized:
+        normalized["last_escalation_json"] = _json_dumps(normalized.pop("last_escalation"))
+    if "builder_report" in normalized:
+        normalized["builder_report_json"] = _json_dumps(normalized.pop("builder_report"))
     if "deploy_target" in normalized:
         normalized["deploy_target_json"] = _json_dumps(normalized.pop("deploy_target"))
     if "preview_metadata" in normalized:
@@ -523,6 +571,14 @@ async def sync_project_from_state(project_id: str, state: dict[str, Any]) -> Non
         update_kwargs["stack_config"] = state.get("stack_config") or {}
     if "llm_config" in state:
         update_kwargs["llm_config"] = state.get("llm_config") or default_llm_config()
+    if "execution_contract" in state:
+        update_kwargs["execution_contract"] = state.get("execution_contract") or {}
+    if "contract_version" in state:
+        update_kwargs["contract_version"] = state.get("contract_version") or 0
+    if "decision_log" in state:
+        update_kwargs["decision_log"] = state.get("decision_log") or []
+    if "plan_delta_history" in state:
+        update_kwargs["plan_delta_history"] = state.get("plan_delta_history") or []
     if "container_id" in state:
         update_kwargs["container_id"] = state.get("container_id") or None
     if "container_port" in state:
@@ -531,6 +587,16 @@ async def sync_project_from_state(project_id: str, state: dict[str, Any]) -> Non
         update_kwargs["project_stage"] = state.get("project_stage") or "intake"
     if "status" in state:
         update_kwargs["status"] = state.get("status") or "pending"
+    if "active_task_id" in state:
+        update_kwargs["active_task_id"] = state.get("active_task_id") or None
+    if "task_attempt_count" in state:
+        update_kwargs["task_attempt_count"] = state.get("task_attempt_count") or 0
+    if "task_validation_result" in state:
+        update_kwargs["task_validation_result"] = state.get("task_validation_result") or {}
+    if "last_escalation" in state:
+        update_kwargs["last_escalation"] = state.get("last_escalation") or {}
+    if "builder_report" in state:
+        update_kwargs["builder_report"] = state.get("builder_report") or {}
     if "repo_name" in state:
         update_kwargs["repo_name"] = state.get("repo_name") or None
     if "repo_url" in state:

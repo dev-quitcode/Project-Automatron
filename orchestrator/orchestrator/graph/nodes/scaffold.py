@@ -12,6 +12,7 @@ from langgraph.types import interrupt
 from orchestrator.config import settings
 from orchestrator.docker_engine.manager import ContainerManager
 from orchestrator.docker_engine.port_allocator import PortAllocator
+from orchestrator.execution_contract import count_contract_progress, get_next_contract_task
 from orchestrator.graph.state import AutomatronState
 from orchestrator.llm.configuration import (
     builder_auth_provider,
@@ -21,6 +22,7 @@ from orchestrator.llm.configuration import (
 )
 from orchestrator.plan_parser.parser import get_next_task, get_progress
 from orchestrator.repository.manager import RepositoryManager
+from orchestrator.validation.workspace import validate_workspace_contract_async
 
 logger = logging.getLogger(__name__)
 
@@ -155,16 +157,55 @@ async def scaffold_node(state: AutomatronState) -> dict:
 
 async def task_selector_node(state: AutomatronState) -> dict:
     plan_md = state.get("plan_md", "")
+    execution_contract = state.get("execution_contract") or {}
+
+    if execution_contract:
+        completed_tasks, total_tasks = count_contract_progress(execution_contract)
+        next_task_contract = get_next_contract_task(execution_contract)
+        if next_task_contract is None:
+            return {
+                "active_task_id": "",
+                "current_task_index": -1,
+                "current_task_text": "",
+                "total_tasks": total_tasks,
+                "completed_tasks": completed_tasks,
+                "escalation_count": 0,
+                "task_attempt_count": 0,
+                "task_validation_result": {},
+                "project_stage": "building",
+                "status": "building",
+            }
+
+        previous_task_id = state.get("active_task_id", "")
+        same_task = previous_task_id == next_task_contract.get("task_id", "")
+        return {
+            "active_task_id": next_task_contract.get("task_id", ""),
+            "current_task_index": int(next_task_contract.get("task_id", "task-001").split("-")[-1]) - 1,
+            "current_task_text": _task_contract_to_text(next_task_contract),
+            "total_tasks": total_tasks,
+            "completed_tasks": completed_tasks,
+            "escalation_count": state.get("escalation_count", 0) if same_task else 0,
+            "task_attempt_count": state.get("task_attempt_count", 0) if same_task else 0,
+            "builder_status": "",
+            "builder_output": "",
+            "builder_error_detail": "",
+            "project_stage": "building",
+            "status": "building",
+        }
+
     progress = get_progress(plan_md)
     next_task = get_next_task(plan_md)
 
     if next_task is None:
         return {
+            "active_task_id": "",
             "current_task_index": -1,
             "current_task_text": "",
             "total_tasks": progress.total,
             "completed_tasks": progress.completed,
             "escalation_count": 0,
+            "task_attempt_count": 0,
+            "task_validation_result": {},
             "project_stage": "building",
             "status": "building",
         }
@@ -173,11 +214,13 @@ async def task_selector_node(state: AutomatronState) -> dict:
     escalation_count = 0 if next_task.index != previous_index else state.get("escalation_count", 0)
 
     return {
+        "active_task_id": f"task-{next_task.index + 1:03d}",
         "current_task_index": next_task.index,
         "current_task_text": f"{next_task.title}\n{next_task.description}".strip(),
         "total_tasks": progress.total,
         "completed_tasks": progress.completed,
         "escalation_count": escalation_count,
+        "task_attempt_count": 0 if next_task.index != previous_index else state.get("task_attempt_count", 0),
         "builder_status": "",
         "builder_output": "",
         "builder_error_detail": "",
@@ -216,9 +259,19 @@ async def freeze_node(state: AutomatronState) -> dict:
 
 async def preview_check_node(state: AutomatronState) -> dict:
     project_id = state["project_id"]
-    missing_artifacts = repository_manager.validate_deploy_artifacts(project_id)
-    if missing_artifacts:
-        raise RuntimeError(f"Missing deploy artifacts: {', '.join(missing_artifacts)}")
+    validation_result = await validate_workspace_contract_async(
+        repository_manager.workspace_path(project_id),
+        stack_config=state.get("stack_config", {}),
+        container_manager=container_manager,
+        container_id=state.get("container_id") or None,
+        require_heavy_checks=True,
+    )
+    if validation_result.blocking_issues:
+        raise RuntimeError(
+            "; ".join(issue.message for issue in validation_result.blocking_issues)
+        )
+    if validation_result.runtime_spec is None:
+        raise RuntimeError("Could not resolve preview runtime spec")
 
     repository_manager.commit_workspace_changes(
         project_id,
@@ -227,20 +280,31 @@ async def preview_check_node(state: AutomatronState) -> dict:
     )
 
     internal_port = int(state.get("stack_config", {}).get("port", 3000) or 3000)
-    await container_manager.start_preview_process(
+    preview_metadata = await container_manager.start_preview_process(
         state["container_id"],
         internal_port=internal_port,
         external_port=state["container_port"],
         stack_config=state.get("stack_config", {}),
         workspace_path=repository_manager.workspace_path(project_id),
+        restart_reason="preview_check",
+        runtime_spec=validation_result.runtime_spec,
     )
-    await container_manager.wait_for_preview(state["container_id"], internal_port=internal_port)
+    await container_manager.wait_for_preview(
+        state["container_id"],
+        internal_port=internal_port,
+        probe_path=validation_result.runtime_spec.readiness_path,
+    )
 
     preview_url = f"http://localhost:{state['container_port']}"
     return {
         "preview_url": preview_url,
         "preview_status": "healthy",
-        "preview_metadata": {"internal_port": internal_port, "checked_at": _now()},
+        "preview_metadata": {
+            **preview_metadata,
+            "internal_port": internal_port,
+            "checked_at": _now(),
+            "probe_path": validation_result.runtime_spec.readiness_path,
+        },
         "project_stage": "awaiting_preview_approval",
         "status": "preview",
         "requires_human": True,
@@ -306,3 +370,15 @@ def repository_manager_metadata_from_state(state: AutomatronState):
         develop_branch=state.get("develop_branch", "develop"),
         feature_branch=state.get("feature_branch", "feature/1-project"),
     )
+
+
+def _task_contract_to_text(task_contract: dict) -> str:
+    lines = [str(task_contract.get("title", "Task")).strip()]
+    goal = str(task_contract.get("goal", "")).strip()
+    if goal:
+        lines.append(goal)
+    for done_when in task_contract.get("done_when", []):
+        lines.append(f"Done when: {done_when}")
+    for command in task_contract.get("validation_commands", []):
+        lines.append(f"Validate with: {command}")
+    return "\n".join(line for line in lines if line)

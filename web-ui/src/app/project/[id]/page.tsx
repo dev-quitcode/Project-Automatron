@@ -112,6 +112,7 @@ export default function ProjectPage() {
     approvePreview,
     deployProject,
     syncCicd,
+    restartPreview,
     updateDeployTarget,
     updateProjectLlmConfig,
     updatePlan,
@@ -283,6 +284,12 @@ export default function ProjectPage() {
   const canDeploy = currentProject?.project_stage === "ready_for_deploy";
   const isDeployed = currentProject?.project_stage === "deployed";
   const deployConfigured = Boolean(currentProject?.deploy_target_summary?.host);
+  const canRestartPreview =
+    Boolean(currentProject?.container_id) &&
+    (currentProject?.status === "preview" ||
+      ["awaiting_preview_approval", "ready_for_deploy", "deployed"].includes(
+        currentProject?.project_stage || ""
+      ));
   const currentStageIndex = stageGroups.findIndex(
     (stage) => stage.id === currentProject?.project_stage
   );
@@ -357,6 +364,16 @@ export default function ProjectPage() {
               <ExternalLink className="h-3.5 w-3.5" />
               Preview
             </a>
+          )}
+
+          {canRestartPreview && (
+            <button
+              onClick={() => void restartPreview(projectId)}
+              className="flex items-center gap-2 rounded-lg border border-border px-4 py-2 text-sm font-medium text-muted-foreground hover:text-foreground"
+            >
+              <RefreshCw className="h-4 w-4" />
+              Restart Preview
+            </button>
           )}
 
           {isDeployed && currentProject.deploy_run_url && (
@@ -643,6 +660,12 @@ export default function ProjectPage() {
                   <span className="text-muted-foreground">URL</span>
                   <span className="truncate text-right">
                     {currentProject.preview_url || "Not ready"}
+                  </span>
+                </div>
+                <div className="flex justify-between gap-3">
+                  <span className="text-muted-foreground">Probe</span>
+                  <span className="truncate text-right">
+                    {(currentProject.preview_metadata?.probe_url as string) || "Pending"}
                   </span>
                 </div>
               </div>
@@ -979,7 +1002,7 @@ export default function ProjectPage() {
                         health_path: event.target.value,
                       }))
                     }
-                    placeholder="/health"
+                    placeholder="/api/health"
                     className="w-full rounded-lg border border-input bg-background px-3 py-2"
                   />
                 </label>
