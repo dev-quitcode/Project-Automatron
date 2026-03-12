@@ -2,13 +2,26 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import * as api from "@/lib/api";
 import { AppLayout } from "@/components/layout";
 import { ChatPanel } from "@/components/project/ChatPanel";
 import { PlanEditor } from "@/components/project/PlanEditor";
+import {
+  cloneProjectLlmConfig,
+  defaultProjectLlmConfig,
+  llmProviders,
+} from "@/lib/llmOptions";
 import { AlertPanel, LogStream, ProgressBar, StatusBadge } from "@/components/ui";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useProjectStore } from "@/stores/projectStore";
-import type { DeployTargetRequest, ProjectStage } from "@/lib/types";
+import type {
+  DeployAuthMode,
+  DeployTargetRequest,
+  LlmProvider,
+  ProjectLlmConfig,
+  ProjectStage,
+  ProviderModelCatalog,
+} from "@/lib/types";
 import {
   ArrowLeft,
   CheckCircle2,
@@ -50,18 +63,30 @@ export default function ProjectPage() {
   const projectId = params.id as string;
 
   const [activeTab, setActiveTab] = useState<ActiveTab>("plan");
+  const [llmConfig, setLlmConfig] = useState<ProjectLlmConfig>(
+    cloneProjectLlmConfig(defaultProjectLlmConfig)
+  );
+  const [providerCatalogs, setProviderCatalogs] = useState<
+    Partial<Record<LlmProvider, ProviderModelCatalog>>
+  >({});
+  const [loadingProviders, setLoadingProviders] = useState<
+    Partial<Record<LlmProvider, boolean>>
+  >({});
   const [deployTarget, setDeployTarget] = useState<DeployTargetRequest>({
+    auth_mode: "ssh_key",
     host: "",
     port: 22,
     user: "",
     deploy_path: "",
     auth_reference: "",
     ssh_private_key: "",
+    ssh_password: "",
     known_hosts: "",
     env_content: "",
     app_url: "",
-    health_path: "",
+    health_path: "/api/health",
   });
+  const [isSavingLlmConfig, setIsSavingLlmConfig] = useState(false);
   const [isSavingDeployTarget, setIsSavingDeployTarget] = useState(false);
   const [isSyncingCicd, setIsSyncingCicd] = useState(false);
 
@@ -88,12 +113,33 @@ export default function ProjectPage() {
     deployProject,
     syncCicd,
     updateDeployTarget,
+    updateProjectLlmConfig,
     updatePlan,
     setHumanRequired,
   } = useProjectStore();
   const targetSummaryKey = JSON.stringify(currentProject?.deploy_target_summary ?? null);
 
   const { sendMessage } = useWebSocket(projectId);
+
+  const loadProviderCatalog = async (
+    provider: LlmProvider,
+    forceRefresh = false
+  ): Promise<ProviderModelCatalog | null> => {
+    if (!forceRefresh && providerCatalogs[provider]) {
+      return providerCatalogs[provider] ?? null;
+    }
+
+    setLoadingProviders((current) => ({ ...current, [provider]: true }));
+    try {
+      const catalog = await api.getProviderModels(provider, forceRefresh);
+      setProviderCatalogs((current) => ({ ...current, [provider]: catalog }));
+      return catalog;
+    } catch {
+      return null;
+    } finally {
+      setLoadingProviders((current) => ({ ...current, [provider]: false }));
+    }
+  };
 
   useEffect(() => {
     if (!projectId) {
@@ -116,21 +162,39 @@ export default function ProjectPage() {
   ]);
 
   useEffect(() => {
+    const providers = new Set<LlmProvider>(
+      Object.values(llmConfig).map((config) => config.provider)
+    );
+    providers.forEach((provider) => {
+      void loadProviderCatalog(provider);
+    });
+  }, [llmConfig.architect.provider, llmConfig.builder.provider, llmConfig.reviewer.provider]);
+
+  useEffect(() => {
+    if (!currentProject?.llm_config) {
+      return;
+    }
+    setLlmConfig(cloneProjectLlmConfig(currentProject.llm_config));
+  }, [currentProject?.id, currentProject?.llm_config]);
+
+  useEffect(() => {
     const target = currentProject?.deploy_target_summary;
     if (!target) {
       return;
     }
     setDeployTarget({
+      auth_mode: target.auth_mode || "ssh_key",
       host: target.host || "",
       port: target.port || 22,
       user: target.user || "",
       deploy_path: target.deploy_path || "",
       auth_reference: target.auth_reference || "",
       ssh_private_key: "",
+      ssh_password: "",
       known_hosts: "",
       env_content: "",
       app_url: target.app_url || "",
-      health_path: target.health_path || "",
+      health_path: target.health_path || "/api/health",
     });
   }, [targetSummaryKey]);
 
@@ -142,6 +206,40 @@ export default function ProjectPage() {
   };
 
   const handleSavePlan = (nextPlanMd: string) => updatePlan(projectId, nextPlanMd);
+
+  const handleSaveLlmConfig = async () => {
+    setIsSavingLlmConfig(true);
+    try {
+      await updateProjectLlmConfig(projectId, llmConfig);
+      await fetchProject(projectId);
+    } finally {
+      setIsSavingLlmConfig(false);
+    }
+  };
+
+  const updateRoleProvider = async (
+    role: keyof ProjectLlmConfig,
+    provider: LlmProvider
+  ) => {
+    setLlmConfig((current) => ({
+      ...current,
+      [role]: {
+        provider,
+        model: "",
+      },
+    }));
+    const catalog = await loadProviderCatalog(provider);
+    setLlmConfig((current) => ({
+      ...current,
+      [role]: {
+        provider,
+        model: catalog?.models[0]?.id ?? "",
+      },
+    }));
+  };
+
+  const modelOptionsFor = (provider: LlmProvider) =>
+    providerCatalogs[provider]?.models ?? [];
 
   const handleSaveDeployTarget = async () => {
     setIsSavingDeployTarget(true);
@@ -183,6 +281,7 @@ export default function ProjectPage() {
   const canApprovePreview =
     currentProject?.project_stage === "awaiting_preview_approval";
   const canDeploy = currentProject?.project_stage === "ready_for_deploy";
+  const isDeployed = currentProject?.project_stage === "deployed";
   const deployConfigured = Boolean(currentProject?.deploy_target_summary?.host);
   const currentStageIndex = stageGroups.findIndex(
     (stage) => stage.id === currentProject?.project_stage
@@ -257,6 +356,18 @@ export default function ProjectPage() {
             >
               <ExternalLink className="h-3.5 w-3.5" />
               Preview
+            </a>
+          )}
+
+          {isDeployed && currentProject.deploy_run_url && (
+            <a
+              href={currentProject.deploy_run_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-sm text-emerald-700 hover:text-emerald-800"
+            >
+              <Rocket className="h-3.5 w-3.5" />
+              Live Deploy
             </a>
           )}
 
@@ -379,6 +490,11 @@ export default function ProjectPage() {
                 <p className="mt-2 text-sm text-muted-foreground">
                   {currentProject.project_stage.replace(/_/g, " ")}
                 </p>
+                {isDeployed && (
+                  <p className="mt-2 text-xs text-emerald-600">
+                    Production rollout completed successfully.
+                  </p>
+                )}
                 {progress && (
                   <div className="mt-4">
                     <ProgressBar
@@ -402,6 +518,90 @@ export default function ProjectPage() {
           </div>
 
           <div className="grid gap-4">
+            <div className="rounded-xl border border-border bg-card p-4">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                    LLM Roles
+                  </p>
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    Configure provider and model for architect, builder, and reviewer.
+                  </p>
+                </div>
+                <button
+                  onClick={() => void handleSaveLlmConfig()}
+                  disabled={isSavingLlmConfig || isRunning}
+                  className="flex items-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                >
+                  <Save className="h-4 w-4" />
+                  {isSavingLlmConfig ? "Saving..." : "Save"}
+                </button>
+              </div>
+
+              <div className="mt-4 space-y-4">
+                {(["architect", "builder", "reviewer"] as const).map((role) => (
+                  <div key={role} className="grid gap-3 md:grid-cols-[96px_1fr_1.2fr]">
+                    <div className="self-center text-sm font-medium capitalize">{role}</div>
+
+                    <label className="space-y-1 text-sm">
+                      <span className="text-muted-foreground">Provider</span>
+                      <select
+                        value={llmConfig[role].provider}
+                        disabled={isRunning}
+                        onChange={(event) => {
+                          const provider = event.target.value as LlmProvider;
+                          void updateRoleProvider(role, provider);
+                        }}
+                        className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+                      >
+                        {llmProviders.map((provider) => (
+                          <option key={provider.value} value={provider.value}>
+                            {provider.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="space-y-1 text-sm">
+                      <span className="text-muted-foreground">Model</span>
+                      <select
+                        value={llmConfig[role].model}
+                        disabled={isRunning}
+                        onChange={(event) =>
+                          setLlmConfig((current) => ({
+                            ...current,
+                            [role]: {
+                              ...current[role],
+                            model: event.target.value,
+                          },
+                        }))
+                      }
+                      className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+                    >
+                        <option value="">
+                          {loadingProviders[llmConfig[role].provider]
+                            ? "Loading models..."
+                            : modelOptionsFor(llmConfig[role].provider).length > 0
+                            ? "Select model"
+                            : "No models available"}
+                        </option>
+                        {modelOptionsFor(llmConfig[role].provider).map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                      </select>
+                      {providerCatalogs[llmConfig[role].provider]?.error && (
+                        <p className="text-xs text-amber-500">
+                          {providerCatalogs[llmConfig[role].provider]?.error}
+                        </p>
+                      )}
+                    </label>
+                  </div>
+                ))}
+              </div>
+            </div>
+
             <div className="rounded-xl border border-border bg-card p-4">
               <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
                 Repository
@@ -454,6 +654,10 @@ export default function ProjectPage() {
               </p>
               <div className="mt-3 space-y-2 text-sm">
                 <div className="flex justify-between gap-3">
+                  <span className="text-muted-foreground">Auth</span>
+                  <span>{currentProject.deploy_target_summary?.auth_mode || "ssh_key"}</span>
+                </div>
+                <div className="flex justify-between gap-3">
                   <span className="text-muted-foreground">Host</span>
                   <span>{currentProject.deploy_target_summary?.host || "Not set"}</span>
                 </div>
@@ -466,6 +670,10 @@ export default function ProjectPage() {
                 <div className="flex justify-between gap-3">
                   <span className="text-muted-foreground">Status</span>
                   <span>{currentProject.deploy_status || "not_configured"}</span>
+                </div>
+                <div className="flex justify-between gap-3">
+                  <span className="text-muted-foreground">Health</span>
+                  <span>{currentProject.deploy_target_summary?.health_path || "/api/health"}</span>
                 </div>
               </div>
             </div>
@@ -647,6 +855,27 @@ export default function ProjectPage() {
                 </label>
 
                 <label className="space-y-1 text-sm">
+                  <span className="text-muted-foreground">Auth Mode</span>
+                  <select
+                    value={deployTarget.auth_mode}
+                    onChange={(event) =>
+                      setDeployTarget((target) => ({
+                        ...target,
+                        auth_mode: event.target.value as DeployAuthMode,
+                        ssh_private_key:
+                          event.target.value === "ssh_key" ? target.ssh_private_key ?? "" : "",
+                        ssh_password:
+                          event.target.value === "password" ? target.ssh_password ?? "" : "",
+                      }))
+                    }
+                    className="w-full rounded-lg border border-input bg-background px-3 py-2"
+                  >
+                    <option value="ssh_key">SSH key</option>
+                    <option value="password">Password</option>
+                  </select>
+                </label>
+
+                <label className="space-y-1 text-sm">
                   <span className="text-muted-foreground">Auth Reference</span>
                   <input
                     value={deployTarget.auth_reference ?? ""}
@@ -660,21 +889,39 @@ export default function ProjectPage() {
                   />
                 </label>
 
-                <label className="space-y-1 text-sm md:col-span-2">
-                  <span className="text-muted-foreground">SSH Private Key</span>
-                  <textarea
-                    value={deployTarget.ssh_private_key ?? ""}
-                    onChange={(event) =>
-                      setDeployTarget((target) => ({
-                        ...target,
-                        ssh_private_key: event.target.value,
-                      }))
-                    }
-                    rows={5}
-                    placeholder="Write-only. Paste the private key used by GitHub Actions for SSH deploy."
-                    className="w-full rounded-lg border border-input bg-background px-3 py-2"
-                  />
-                </label>
+                {deployTarget.auth_mode === "ssh_key" ? (
+                  <label className="space-y-1 text-sm md:col-span-2">
+                    <span className="text-muted-foreground">SSH Private Key</span>
+                    <textarea
+                      value={deployTarget.ssh_private_key ?? ""}
+                      onChange={(event) =>
+                        setDeployTarget((target) => ({
+                          ...target,
+                          ssh_private_key: event.target.value,
+                        }))
+                      }
+                      rows={5}
+                      placeholder="Write-only. Paste the private key used by GitHub Actions for SSH deploy."
+                      className="w-full rounded-lg border border-input bg-background px-3 py-2"
+                    />
+                  </label>
+                ) : (
+                  <label className="space-y-1 text-sm md:col-span-2">
+                    <span className="text-muted-foreground">SSH Password</span>
+                    <textarea
+                      value={deployTarget.ssh_password ?? ""}
+                      onChange={(event) =>
+                        setDeployTarget((target) => ({
+                          ...target,
+                          ssh_password: event.target.value,
+                        }))
+                      }
+                      rows={3}
+                      placeholder="Write-only. Stored as a GitHub environment secret for password-based SSH deploy."
+                      className="w-full rounded-lg border border-input bg-background px-3 py-2"
+                    />
+                  </label>
+                )}
 
                 <label className="space-y-1 text-sm md:col-span-2">
                   <span className="text-muted-foreground">Known Hosts</span>

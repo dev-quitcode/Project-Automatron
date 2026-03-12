@@ -7,6 +7,7 @@ import type {
   DeployTargetRequest,
   PlanProgress,
   Project,
+  ProjectLlmConfig,
   ProjectStage,
 } from "@/lib/types";
 
@@ -47,7 +48,11 @@ interface ProjectState {
 
   fetchProjects: () => Promise<void>;
   fetchProject: (id: string) => Promise<void>;
-  createProject: (name: string, intakeText: string) => Promise<Project>;
+  createProject: (
+    name: string,
+    intakeText: string,
+    llmConfig: ProjectLlmConfig
+  ) => Promise<Project>;
   startProject: (id: string) => Promise<void>;
   stopProject: (id: string) => Promise<void>;
   approvePlan: (id: string, feedback?: string) => Promise<void>;
@@ -59,6 +64,7 @@ interface ProjectState {
   fetchDeployRuns: (projectId: string) => Promise<void>;
   fetchPlan: (projectId: string) => Promise<void>;
   updatePlan: (projectId: string, planMd: string) => Promise<void>;
+  updateProjectLlmConfig: (projectId: string, llmConfig: ProjectLlmConfig) => Promise<void>;
   updateDeployTarget: (
     projectId: string,
     target: DeployTargetRequest
@@ -179,13 +185,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     }
   },
 
-  createProject: async (name, intakeText) => {
+  createProject: async (name, intakeText, llmConfig) => {
     set({ isLoading: true, error: null });
     try {
       const project = await api.createProject({
         name,
         intake_text: intakeText,
         source: "manual",
+        llm_config: llmConfig,
       });
       set((state) => ({
         projects: [...state.projects, project],
@@ -342,12 +349,29 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     }
   },
 
+  updateProjectLlmConfig: async (projectId, llmConfig) => {
+    set({ error: null });
+    try {
+      const project = await api.updateProjectLlmConfig(projectId, llmConfig);
+      set((state) => ({
+        projects: state.projects.map((item) =>
+          item.id === project.id ? project : item
+        ),
+        currentProject:
+          state.currentProject?.id === project.id ? project : state.currentProject,
+      }));
+    } catch (error: any) {
+      set({ error: error.message });
+    }
+  },
+
   updateDeployTarget: async (projectId, target) => {
     try {
       await api.updateDeployTarget(projectId, target);
       get().patchProject(projectId, {
         deploy_status: "configured",
         deploy_target_summary: {
+          auth_mode: target.auth_mode,
           host: target.host,
           port: target.port ?? 22,
           user: target.user,

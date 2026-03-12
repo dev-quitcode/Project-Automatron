@@ -165,3 +165,19 @@ def get_global_rules(content: str) -> list[str]:
         return rules if isinstance(rules, list) else []
     except Exception:
         return []
+
+
+def mark_task_completed(content: str, task_index: int) -> str:
+    """Mark a task checkbox as completed by global task index."""
+    tasks = _extract_tasks(content)
+    target = next((task for task in tasks if task.index == task_index), None)
+    if target is None:
+        return content
+
+    lines = content.split("\n")
+    line_idx = target.line_number - 1
+    if not (0 <= line_idx < len(lines)):
+        return content
+
+    lines[line_idx] = re.sub(r"\[ \]", "[x]", lines[line_idx], count=1)
+    return "\n".join(lines)

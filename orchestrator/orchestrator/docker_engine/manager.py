@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import shlex
 import tarfile
 from pathlib import Path
 from dataclasses import dataclass
@@ -65,7 +66,7 @@ class ContainerManager:
             raise RuntimeError("Docker client not available")
 
         container_name = f"automatron-{project_id[:8]}"
-        workspace_path = Path(settings.workspace_base_path) / project_id
+        workspace_path = settings.workspace_base_dir / project_id
         workspace_path.mkdir(parents=True, exist_ok=True)
         image = settings.golden_image
         internal_port = stack_config.get("port", 3000)
@@ -74,6 +75,8 @@ class ContainerManager:
         environment = {
             "PROJECT_ID": project_id,
             "TERM": "xterm-256color",
+            "HOME": "/home/developer",
+            "XDG_CONFIG_HOME": "/home/developer/.config",
         }
 
         # Inject API keys from settings (read from Docker Secrets at app start)
@@ -93,6 +96,19 @@ class ContainerManager:
         )
 
         try:
+            try:
+                existing = self.client.containers.get(container_name)
+            except NotFound:
+                existing = None
+
+            if existing is not None:
+                logger.warning(
+                    "Removing stale container with reused project name: %s (%s)",
+                    container_name,
+                    existing.id[:12],
+                )
+                existing.remove(force=True)
+
             container = self.client.containers.run(
                 image=image,
                 name=container_name,
@@ -109,6 +125,36 @@ class ContainerManager:
                 cpu_period=100000,
                 cpu_quota=100000,  # 1 CPU core
                 restart_policy={"Name": "unless-stopped"},
+            )
+
+            # Windows bind mounts commonly surface as root-owned paths inside the
+            # Linux container. Normalize ownership once so builder tasks can write
+            # to /workspace without sudo workarounds.
+            container.exec_run(
+                cmd=[
+                    "bash",
+                    "-lc",
+                    (
+                        "DEV_GROUP=$(id -gn developer 2>/dev/null || echo developer) && "
+                        "chown -R developer:${DEV_GROUP} /workspace && "
+                        "chmod -R u+rwX /workspace && "
+                        "mkdir -p /home/developer/.config/prisma-nodejs && "
+                        "chown -R developer:${DEV_GROUP} /home/developer"
+                    ),
+                ],
+                user="root",
+            )
+            container.exec_run(
+                cmd=[
+                    "bash",
+                    "-lc",
+                    "git config --global --add safe.directory /workspace",
+                ],
+                user="developer",
+                environment={
+                    "HOME": "/home/developer",
+                    "XDG_CONFIG_HOME": "/home/developer/.config",
+                },
             )
 
             logger.info(
@@ -149,8 +195,14 @@ class ContainerManager:
 
         try:
             container = self.client.containers.get(container_id)
+            wrapped_command = command
+            if timeout > 0:
+                wrapped_command = (
+                    f"timeout --signal=TERM {timeout}s "
+                    f"bash -lc {shlex.quote(command)}"
+                )
             exec_result = container.exec_run(
-                cmd=["bash", "-c", command],
+                cmd=["bash", "-lc", wrapped_command],
                 workdir="/workspace",
                 user="developer",
                 demux=True,

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from orchestrator.graph.runner import (
-    _get_graph,
+    _aget_graph,
     _make_thread_config,
     deploy_project as runner_deploy,
     get_checkpoints,
@@ -19,6 +19,8 @@ from orchestrator.graph.runner import (
     start_project as runner_start,
     stop_project as runner_stop,
 )
+from orchestrator.llm.catalog import get_all_provider_model_catalogs, get_provider_model_catalog
+from orchestrator.llm.configuration import default_llm_config, normalize_llm_config
 from orchestrator.repository.manager import RepositoryManager
 from orchestrator.models.project import (
     create_project,
@@ -29,6 +31,7 @@ from orchestrator.models.project import (
     get_task_logs,
     sync_project_from_state,
     update_project_deploy_target,
+    update_project_llm_config,
     update_project_plan,
     update_project_stage,
     update_project_status,
@@ -39,12 +42,24 @@ router = APIRouter()
 repository_manager = RepositoryManager()
 
 
+class RoleLlmConfig(BaseModel):
+    provider: str
+    model: str
+
+
+class ProjectLlmConfigRequest(BaseModel):
+    architect: RoleLlmConfig
+    builder: RoleLlmConfig
+    reviewer: RoleLlmConfig
+
+
 class CreateProjectRequest(BaseModel):
     name: str
     intake_text: str | None = None
     description: str | None = None
     source: str = "manual"
     source_ref: str | None = None
+    llm_config: ProjectLlmConfigRequest | None = None
 
 
 class UpdatePlanRequest(BaseModel):
@@ -60,16 +75,18 @@ class RollbackRequest(BaseModel):
 
 
 class DeployTargetRequest(BaseModel):
+    auth_mode: Literal["ssh_key", "password"] = "ssh_key"
     host: str
     port: int = 22
     user: str
     deploy_path: str
     auth_reference: str | None = None
-    ssh_private_key: str
+    ssh_private_key: str | None = None
+    ssh_password: str | None = None
     known_hosts: str | None = None
     env_content: str | None = None
     app_url: str | None = None
-    health_path: str | None = None
+    health_path: str | None = "/api/health"
 
 
 class ProjectResponse(BaseModel):
@@ -83,6 +100,7 @@ class ProjectResponse(BaseModel):
     project_stage: str
     plan_md: str | None
     stack_config: dict[str, Any] = Field(default_factory=dict)
+    llm_config: dict[str, Any] = Field(default_factory=default_llm_config)
     repo_name: str | None
     repo_url: str | None
     repo_clone_url: str | None
@@ -109,11 +127,38 @@ class ProjectResponse(BaseModel):
     updated_at: str
 
 
+class ModelCatalogEntry(BaseModel):
+    id: str
+    label: str
+
+
+class ProviderModelCatalogResponse(BaseModel):
+    provider: str
+    configured: bool
+    models: list[ModelCatalogEntry] = Field(default_factory=list)
+    fetched_at: str | None = None
+    error: str | None = None
+    cached: bool = False
+
+
 async def _get_required_project(project_id: str) -> dict[str, Any]:
     project = await get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+@router.get("/llm/providers", response_model=list[ProviderModelCatalogResponse])
+async def api_get_llm_provider_catalogs(force_refresh: bool = False) -> Any:
+    return await get_all_provider_model_catalogs(force_refresh=force_refresh)
+
+
+@router.get("/llm/providers/{provider}/models", response_model=ProviderModelCatalogResponse)
+async def api_get_llm_provider_models(provider: str, force_refresh: bool = False) -> Any:
+    try:
+        return await get_provider_model_catalog(provider, force_refresh=force_refresh)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/projects", response_model=ProjectResponse)
@@ -128,6 +173,7 @@ async def api_create_project(req: CreateProjectRequest) -> Any:
         intake_text,
         intake_source=req.source,
         source_ref=req.source_ref,
+        llm_config=normalize_llm_config(req.llm_config.model_dump() if req.llm_config else None),
     )
     return project
 
@@ -156,6 +202,13 @@ async def api_update_plan(project_id: str, req: UpdatePlanRequest) -> dict[str, 
     await _get_required_project(project_id)
     await update_project_plan(project_id, req.plan_md)
     return {"status": "updated"}
+
+
+@router.put("/projects/{project_id}/llm-config", response_model=ProjectResponse)
+async def api_update_llm_config(project_id: str, req: ProjectLlmConfigRequest) -> Any:
+    await _get_required_project(project_id)
+    await update_project_llm_config(project_id, normalize_llm_config(req.model_dump()))
+    return await _get_required_project(project_id)
 
 
 @router.get("/projects/{project_id}/plan")
@@ -197,6 +250,8 @@ async def api_stop_project(project_id: str) -> dict[str, str]:
 async def api_update_deploy_target(project_id: str, req: DeployTargetRequest) -> dict[str, str]:
     project = await _get_required_project(project_id)
     deploy_target = req.model_dump()
+    if not str(deploy_target.get("health_path", "") or "").strip():
+        deploy_target["health_path"] = "/api/health"
     if project.get("repo_name"):
         await repository_manager.configure_remote_cicd_for_target(project["repo_name"], deploy_target)
     await update_project_deploy_target(project_id, deploy_target)
@@ -227,7 +282,7 @@ async def api_rollback(project_id: str, req: RollbackRequest) -> dict[str, str]:
     if is_running(project_id):
         raise HTTPException(status_code=409, detail="Cannot rollback while the project is running")
 
-    graph = _get_graph()
+    graph = await _aget_graph()
     config = _make_thread_config(project_id)
     target_state = None
     async for checkpoint in graph.aget_state_history(config):

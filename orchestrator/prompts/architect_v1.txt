@@ -59,6 +59,14 @@ global_rules:
 9. Assume the coder has NO context beyond what's in this plan
 10. Maximum 25 tasks for MVP — keep it focused
 
+11. Prefer current stable framework/tooling versions unless the user explicitly requests a pinned version
+12. Assume the platform may pre-scaffold the base app before builder tasks start; prefer verifying or adapting the existing scaffold instead of regenerating it unless the scaffold is clearly unusable
+13. For modern Next.js + Tailwind scaffolds, treat Tailwind v4 zero-config setups as valid; do not require `tailwind.config.ts` unless custom Tailwind configuration is actually needed
+14. Inspect the installed Prisma major version before prescribing Prisma setup changes.
+15. For Prisma 5, keep a valid `url` inside the `datasource db` block in `prisma/schema.prisma`.
+16. For Prisma 7, any `prisma.config.ts` or `prisma.config.js` must live at `/workspace/prisma.config.ts` or `/workspace/prisma.config.js`, not inside `/workspace/prisma`
+17. For Prisma 7 config examples, use `import { defineConfig } from "prisma/config"` or the CommonJS equivalent from `prisma/config`
+
 ## Communication Style
 
 - Ask clarifying questions if the user's requirements are ambiguous

@@ -22,6 +22,7 @@ CI_SECRET_NAMES = {
     "user": "AUTOMATRON_DEPLOY_USER",
     "deploy_path": "AUTOMATRON_DEPLOY_PATH",
     "ssh_private_key": "AUTOMATRON_DEPLOY_SSH_PRIVATE_KEY",
+    "ssh_password": "AUTOMATRON_DEPLOY_SSH_PASSWORD",
     "known_hosts": "AUTOMATRON_DEPLOY_KNOWN_HOSTS",
     "env_content": "AUTOMATRON_DEPLOY_ENV_FILE",
     "app_url": "AUTOMATRON_APP_URL",
@@ -58,7 +59,7 @@ class GitHubActionsManager:
         environment = environment_name or settings.github_environment_name
         await self._put(
             f"{self._repo_path(repo_name)}/environments/{quote(environment, safe='')}",
-            json={"wait_timer": 0},
+            json={},
         )
 
     async def upsert_environment_secrets(
@@ -84,20 +85,34 @@ class GitHubActionsManager:
         return sorted(secrets)
 
     def build_environment_secrets(self, deploy_target: dict[str, Any]) -> dict[str, str]:
-        required = ("host", "user", "deploy_path", "ssh_private_key")
+        required = ("host", "user", "deploy_path")
         missing = [field for field in required if not str(deploy_target.get(field, "")).strip()]
         if missing:
             raise RuntimeError(
                 f"Deploy target is missing GitHub Actions secrets: {', '.join(missing)}"
             )
 
+        auth_mode = str(deploy_target.get("auth_mode", "ssh_key") or "ssh_key").strip().lower()
+        if auth_mode not in {"ssh_key", "password"}:
+            raise RuntimeError(f"Unsupported deploy auth_mode: {auth_mode}")
+
         secrets = {
             CI_SECRET_NAMES["host"]: str(deploy_target["host"]),
             CI_SECRET_NAMES["port"]: str(deploy_target.get("port", 22) or 22),
             CI_SECRET_NAMES["user"]: str(deploy_target["user"]),
             CI_SECRET_NAMES["deploy_path"]: str(deploy_target["deploy_path"]),
-            CI_SECRET_NAMES["ssh_private_key"]: str(deploy_target["ssh_private_key"]),
         }
+
+        if auth_mode == "password":
+            ssh_password = str(deploy_target.get("ssh_password", "") or "").strip()
+            if not ssh_password:
+                raise RuntimeError("Deploy target is missing GitHub Actions secrets: ssh_password")
+            secrets[CI_SECRET_NAMES["ssh_password"]] = ssh_password
+        else:
+            ssh_private_key = str(deploy_target.get("ssh_private_key", "") or "").strip()
+            if not ssh_private_key:
+                raise RuntimeError("Deploy target is missing GitHub Actions secrets: ssh_private_key")
+            secrets[CI_SECRET_NAMES["ssh_private_key"]] = ssh_private_key
 
         for source_key in ("known_hosts", "env_content", "app_url", "health_path"):
             value = str(deploy_target.get(source_key, "") or "").strip()
@@ -316,17 +331,24 @@ jobs:
       - name: Prepare SSH
         env:
           SSH_PRIVATE_KEY: ${{{{ secrets.{CI_SECRET_NAMES["ssh_private_key"]} }}}}
+          SSH_PASSWORD: ${{{{ secrets.{CI_SECRET_NAMES["ssh_password"]} }}}}
           SSH_HOST: ${{{{ secrets.{CI_SECRET_NAMES["host"]} }}}}
           SSH_PORT: ${{{{ secrets.{CI_SECRET_NAMES["port"]} }}}}
           SSH_KNOWN_HOSTS: ${{{{ secrets.{CI_SECRET_NAMES["known_hosts"]} }}}}
         run: |
           mkdir -p ~/.ssh
-          printf '%s\\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$SSH_PRIVATE_KEY" ]; then
+            printf '%s\\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+            chmod 600 ~/.ssh/id_ed25519
+          fi
           if [ -n "$SSH_KNOWN_HOSTS" ]; then
             printf '%s\\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
           else
             ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" > ~/.ssh/known_hosts
+          fi
+          if [ -z "$SSH_PRIVATE_KEY" ] && [ -n "$SSH_PASSWORD" ]; then
+            sudo apt-get update
+            sudo apt-get install -y sshpass
           fi
 
       - name: Build release archive
@@ -341,34 +363,61 @@ jobs:
 
       - name: Upload release
         env:
+          SSH_PRIVATE_KEY: ${{{{ secrets.{CI_SECRET_NAMES["ssh_private_key"]} }}}}
+          SSH_PASSWORD: ${{{{ secrets.{CI_SECRET_NAMES["ssh_password"]} }}}}
           SSH_HOST: ${{{{ secrets.{CI_SECRET_NAMES["host"]} }}}}
           SSH_PORT: ${{{{ secrets.{CI_SECRET_NAMES["port"]} }}}}
           SSH_USER: ${{{{ secrets.{CI_SECRET_NAMES["user"]} }}}}
           DEPLOY_PATH: ${{{{ secrets.{CI_SECRET_NAMES["deploy_path"]} }}}}
           DEPLOY_ENV_FILE: ${{{{ secrets.{CI_SECRET_NAMES["env_content"]} }}}}
         run: |
-          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$DEPLOY_PATH'"
-          scp -P "$SSH_PORT" /tmp/automatron-release.tgz "$SSH_USER@$SSH_HOST:/tmp/automatron-release.tgz"
+          if [ -n "$SSH_PRIVATE_KEY" ]; then
+            ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$DEPLOY_PATH'"
+            scp -P "$SSH_PORT" /tmp/automatron-release.tgz "$SSH_USER@$SSH_HOST:/tmp/automatron-release.tgz"
+          else
+            export SSHPASS="$SSH_PASSWORD"
+            sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$DEPLOY_PATH'"
+            sshpass -e scp -o PreferredAuthentications=password -o PubkeyAuthentication=no -P "$SSH_PORT" /tmp/automatron-release.tgz "$SSH_USER@$SSH_HOST:/tmp/automatron-release.tgz"
+          fi
           if [ -n "$DEPLOY_ENV_FILE" ]; then
             printf '%s' "$DEPLOY_ENV_FILE" > /tmp/automatron.env
-            scp -P "$SSH_PORT" /tmp/automatron.env "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/.env"
+            if [ -n "$SSH_PRIVATE_KEY" ]; then
+              scp -P "$SSH_PORT" /tmp/automatron.env "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/.env"
+            else
+              export SSHPASS="$SSH_PASSWORD"
+              sshpass -e scp -o PreferredAuthentications=password -o PubkeyAuthentication=no -P "$SSH_PORT" /tmp/automatron.env "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/.env"
+            fi
           fi
 
       - name: Deploy on target
         env:
+          SSH_PRIVATE_KEY: ${{{{ secrets.{CI_SECRET_NAMES["ssh_private_key"]} }}}}
+          SSH_PASSWORD: ${{{{ secrets.{CI_SECRET_NAMES["ssh_password"]} }}}}
           SSH_HOST: ${{{{ secrets.{CI_SECRET_NAMES["host"]} }}}}
           SSH_PORT: ${{{{ secrets.{CI_SECRET_NAMES["port"]} }}}}
           SSH_USER: ${{{{ secrets.{CI_SECRET_NAMES["user"]} }}}}
           DEPLOY_PATH: ${{{{ secrets.{CI_SECRET_NAMES["deploy_path"]} }}}}
         run: |
-          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
-            set -e
-            mkdir -p '$DEPLOY_PATH'
-            tar -xzf /tmp/automatron-release.tgz -C '$DEPLOY_PATH'
-            rm -f /tmp/automatron-release.tgz
-            cd '$DEPLOY_PATH'
-            docker compose -f deploy/docker-compose.yml up -d --build
-          "
+          if [ -n "$SSH_PRIVATE_KEY" ]; then
+            ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
+              set -e
+              mkdir -p '$DEPLOY_PATH'
+              tar -xzf /tmp/automatron-release.tgz -C '$DEPLOY_PATH'
+              rm -f /tmp/automatron-release.tgz
+              cd '$DEPLOY_PATH'
+              docker compose -f deploy/docker-compose.yml up -d --build
+            "
+          else
+            export SSHPASS="$SSH_PASSWORD"
+            sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "
+              set -e
+              mkdir -p '$DEPLOY_PATH'
+              tar -xzf /tmp/automatron-release.tgz -C '$DEPLOY_PATH'
+              rm -f /tmp/automatron-release.tgz
+              cd '$DEPLOY_PATH'
+              docker compose -f deploy/docker-compose.yml up -d --build
+            "
+          fi
 
       - name: Health check
         env:

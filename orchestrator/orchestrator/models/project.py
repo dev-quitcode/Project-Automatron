@@ -11,6 +11,7 @@ from typing import Any
 import aiosqlite
 
 from orchestrator.config import settings
+from orchestrator.llm.configuration import default_llm_config, normalize_llm_config
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ PROJECT_COLUMN_DEFS: dict[str, str] = {
     "intake_text": "TEXT NOT NULL DEFAULT ''",
     "intake_source": "TEXT NOT NULL DEFAULT 'manual'",
     "source_ref": "TEXT",
+    "llm_config_json": "TEXT",
     "repo_name": "TEXT",
     "repo_url": "TEXT",
     "repo_clone_url": "TEXT",
@@ -52,6 +54,7 @@ PROJECT_COLUMN_DEFS: dict[str, str] = {
 
 JSON_FIELDS = {
     "stack_config_json",
+    "llm_config_json",
     "deploy_target_json",
     "preview_metadata_json",
     "approval_history_json",
@@ -59,6 +62,7 @@ JSON_FIELDS = {
 BOOL_FIELDS = {"repo_ready", "plan_approved", "preview_approved"}
 JSON_FIELD_DEFAULTS: dict[str, Any] = {
     "stack_config_json": {},
+    "llm_config_json": default_llm_config(),
     "deploy_target_json": {},
     "preview_metadata_json": {},
     "approval_history_json": [],
@@ -67,6 +71,14 @@ JSON_FIELD_DEFAULTS: dict[str, Any] = {
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+async def _ensure_db_ready() -> None:
+    target_path = _db_path or settings.sqlite_db_path
+    if not target_path:
+        raise RuntimeError("SQLite database path is not configured")
+    if not _db_path or not Path(target_path).exists():
+        await init_db(target_path)
 
 
 def _json_dumps(value: Any) -> str:
@@ -95,6 +107,7 @@ def _serialize_project_row(row: aiosqlite.Row) -> dict[str, Any]:
     project["deploy_target"] = deploy_target
     project["deploy_target_summary"] = _summarize_deploy_target(deploy_target)
     project["stack_config"] = project.get("stack_config_json") or {}
+    project["llm_config"] = normalize_llm_config(project.get("llm_config_json") or {})
     project["preview_metadata"] = project.get("preview_metadata_json") or {}
     project["approval_history"] = project.get("approval_history_json") or []
     project["description"] = project.get("intake_text", "")
@@ -108,13 +121,14 @@ def _summarize_deploy_target(target: dict[str, Any] | None) -> dict[str, Any] | 
         return None
 
     return {
+        "auth_mode": target.get("auth_mode", "ssh_key"),
         "host": target.get("host"),
         "port": target.get("port", 22),
         "user": target.get("user"),
         "deploy_path": target.get("deploy_path"),
         "auth_reference": target.get("auth_reference"),
         "app_url": target.get("app_url"),
-        "health_path": target.get("health_path"),
+        "health_path": target.get("health_path") or "/api/health",
     }
 
 
@@ -152,6 +166,7 @@ async def init_db(db_path: str) -> None:
                 source_ref TEXT,
                 plan_md TEXT,
                 stack_config_json TEXT,
+                llm_config_json TEXT,
                 repo_name TEXT,
                 repo_url TEXT,
                 repo_clone_url TEXT,
@@ -257,9 +272,12 @@ async def create_project(
     intake_text: str,
     intake_source: str = "manual",
     source_ref: str | None = None,
+    llm_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a new project record."""
+    await _ensure_db_ready()
     now = _now()
+    normalized_llm_config = normalize_llm_config(llm_config)
     async with aiosqlite.connect(_db_path) as db:
         await db.execute(
             """
@@ -273,6 +291,7 @@ async def create_project(
                 source_ref,
                 plan_md,
                 stack_config_json,
+                llm_config_json,
                 preview_status,
                 ci_status,
                 deploy_status,
@@ -281,7 +300,7 @@ async def create_project(
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, 'pending', 'intake', ?, ?, ?, '', '{}', 'pending', 'not_configured', 'not_configured', ?, '[]', ?, ?)
+            VALUES (?, ?, 'pending', 'intake', ?, ?, ?, '', '{}', ?, 'pending', 'not_configured', 'not_configured', ?, '[]', ?, ?)
             """,
             (
                 project_id,
@@ -289,6 +308,7 @@ async def create_project(
                 intake_text,
                 intake_source,
                 source_ref,
+                _json_dumps(normalized_llm_config),
                 settings.github_environment_name,
                 now,
                 now,
@@ -304,6 +324,7 @@ async def create_project(
 
 async def get_project(project_id: str) -> dict[str, Any] | None:
     """Get a project by ID."""
+    await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
@@ -313,6 +334,7 @@ async def get_project(project_id: str) -> dict[str, Any] | None:
 
 async def get_all_projects() -> list[dict[str, Any]]:
     """Get all projects ordered by creation date."""
+    await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM projects ORDER BY created_at DESC")
@@ -325,6 +347,8 @@ def _normalize_update_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
 
     if "stack_config" in normalized:
         normalized["stack_config_json"] = _json_dumps(normalized.pop("stack_config"))
+    if "llm_config" in normalized:
+        normalized["llm_config_json"] = _json_dumps(normalize_llm_config(normalized.pop("llm_config")))
     if "deploy_target" in normalized:
         normalized["deploy_target_json"] = _json_dumps(normalized.pop("deploy_target"))
     if "preview_metadata" in normalized:
@@ -348,6 +372,7 @@ async def update_project(project_id: str, **kwargs: Any) -> None:
     if not kwargs:
         return
 
+    await _ensure_db_ready()
     normalized = _normalize_update_kwargs(kwargs)
     normalized["updated_at"] = _now()
 
@@ -361,6 +386,10 @@ async def update_project(project_id: str, **kwargs: Any) -> None:
 
 async def update_project_plan(project_id: str, plan_md: str) -> None:
     await update_project(project_id, plan_md=plan_md)
+
+
+async def update_project_llm_config(project_id: str, llm_config: dict[str, Any]) -> None:
+    await update_project(project_id, llm_config=normalize_llm_config(llm_config))
 
 
 async def update_project_status(project_id: str, status: str) -> None:
@@ -492,6 +521,8 @@ async def sync_project_from_state(project_id: str, state: dict[str, Any]) -> Non
         update_kwargs["plan_md"] = state.get("plan_md") or ""
     if "stack_config" in state:
         update_kwargs["stack_config"] = state.get("stack_config") or {}
+    if "llm_config" in state:
+        update_kwargs["llm_config"] = state.get("llm_config") or default_llm_config()
     if "container_id" in state:
         update_kwargs["container_id"] = state.get("container_id") or None
     if "container_port" in state:
@@ -550,6 +581,7 @@ async def sync_project_from_state(project_id: str, state: dict[str, Any]) -> Non
 
 
 async def save_chat_message(message_id: str, project_id: str, role: str, content: str) -> None:
+    await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         await db.execute(
             """
@@ -562,6 +594,7 @@ async def save_chat_message(message_id: str, project_id: str, role: str, content
 
 
 async def get_chat_messages(project_id: str) -> list[dict[str, Any]]:
+    await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -581,6 +614,7 @@ async def save_task_log(
     cline_output: str,
     duration_s: float,
 ) -> None:
+    await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         await db.execute(
             """
@@ -594,6 +628,7 @@ async def save_task_log(
 
 
 async def get_task_logs(project_id: str) -> list[dict[str, Any]]:
+    await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -620,6 +655,7 @@ async def save_deploy_run(
     *,
     deployed_at: str | None = None,
 ) -> None:
+    await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         await db.execute(
             """
@@ -650,6 +686,7 @@ async def upsert_deploy_run(
     *,
     deployed_at: str | None = None,
 ) -> None:
+    await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT created_at FROM deploy_runs WHERE id = ?", (run_id,))
@@ -676,6 +713,7 @@ async def upsert_deploy_run(
 
 
 async def get_deploy_runs(project_id: str) -> list[dict[str, Any]]:
+    await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(

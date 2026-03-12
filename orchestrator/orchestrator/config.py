@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pydantic import field_validator
@@ -32,7 +33,8 @@ class Settings(BaseSettings):
 
     # --- Builder ---
     builder_model: str = "anthropic/claude-sonnet-4-20250514"
-    builder_cline_timeout: int = 300
+    builder_cline_timeout: int = 900
+    reviewer_model: str = "gpt-4.1-mini"
 
     # --- Docker ---
     golden_image: str = "automatron/golden:latest"
@@ -74,7 +76,11 @@ class Settings(BaseSettings):
 
     @property
     def workspace_base_dir(self) -> Path:
-        path = Path(self.workspace_base_path)
+        raw_path = self.workspace_base_path.strip()
+        if os.name == "nt" and raw_path.startswith("/"):
+            path = Path.cwd() / "workspaces"
+        else:
+            path = Path(raw_path)
         path.mkdir(parents=True, exist_ok=True)
         return path
 

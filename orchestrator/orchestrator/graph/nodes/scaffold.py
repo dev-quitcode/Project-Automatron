@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shlex
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage
@@ -12,6 +13,12 @@ from orchestrator.config import settings
 from orchestrator.docker_engine.manager import ContainerManager
 from orchestrator.docker_engine.port_allocator import PortAllocator
 from orchestrator.graph.state import AutomatronState
+from orchestrator.llm.configuration import (
+    builder_auth_provider,
+    default_llm_config,
+    normalize_llm_config,
+    provider_api_key,
+)
 from orchestrator.plan_parser.parser import get_next_task, get_progress
 from orchestrator.repository.manager import RepositoryManager
 
@@ -28,6 +35,14 @@ def _now() -> str:
 
 async def plan_review_node(state: AutomatronState) -> dict:
     """Pause after plan generation or freeze escalation."""
+    if state.get("container_id") and not state.get("requires_human", False):
+        return {
+            "requires_human": False,
+            "human_intervention_reason": "",
+            "project_stage": "building",
+            "status": "building",
+        }
+
     project_id = state["project_id"]
     reason = state.get("human_intervention_reason") or "Review and approve the technical plan."
     approval = interrupt(
@@ -90,6 +105,9 @@ async def scaffold_node(state: AutomatronState) -> dict:
     )
 
     init_script = stack_config.get("init_script") or "init-generic.sh"
+    llm_config = normalize_llm_config(state.get("llm_config") or default_llm_config())
+    builder_provider = llm_config["builder"]["provider"]
+    builder_model = llm_config["builder"]["model"]
     script_path = f"/opt/automatron/scripts/{init_script}"
     try:
         await container_manager.exec_in_container(
@@ -100,11 +118,19 @@ async def scaffold_node(state: AutomatronState) -> dict:
     except Exception as exc:
         logger.warning("Init script %s failed: %s", init_script, exc)
 
-    if settings.openai_api_key:
+    provider_key = provider_api_key(builder_provider)
+    if provider_key:
         try:
             await container_manager.exec_in_container(
                 container_info.container_id,
-                f"cline auth -p openai -k $OPENAI_API_KEY -m {settings.builder_model}",
+                " ".join(
+                    [
+                        "cline auth",
+                        f"-p {builder_auth_provider(builder_provider)}",
+                        f"-k {shlex.quote(provider_key)}",
+                        f"-m {shlex.quote(builder_model)}",
+                    ]
+                ),
                 timeout=30,
             )
         except Exception as exc:

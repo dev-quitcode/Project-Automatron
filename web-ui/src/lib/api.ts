@@ -3,9 +3,12 @@ import type {
   ChatMessage,
   DeployRun,
   DeployTargetRequest,
+  LlmProvider,
+  ProviderModelCatalog,
   Project,
   ProjectCreateRequest,
   Session,
+  UpdateProjectLlmConfigRequest,
 } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -49,6 +52,14 @@ export async function getProjects(): Promise<Project[]> {
 
 export async function getProject(id: string): Promise<Project> {
   return request(`/api/projects/${id}`);
+}
+
+export async function getProviderModels(
+  provider: LlmProvider,
+  forceRefresh = false
+): Promise<ProviderModelCatalog> {
+  const suffix = forceRefresh ? "?force_refresh=true" : "";
+  return request(`/api/llm/providers/${provider}/models${suffix}`);
 }
 
 export async function syncProjectCicd(id: string): Promise<Project> {
@@ -117,6 +128,16 @@ export async function updateProjectPlan(
   return request(`/api/projects/${projectId}/plan`, {
     method: "PUT",
     body: JSON.stringify({ plan_md: planMd }),
+  });
+}
+
+export async function updateProjectLlmConfig(
+  projectId: string,
+  llmConfig: UpdateProjectLlmConfigRequest
+): Promise<Project> {
+  return request(`/api/projects/${projectId}/llm-config`, {
+    method: "PUT",
+    body: JSON.stringify(llmConfig),
   });
 }
 

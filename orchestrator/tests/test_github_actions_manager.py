@@ -20,12 +20,13 @@ def test_workflow_files_include_ci_and_deploy():
     assert "environment: production" in workflow_files[".github/workflows/deploy.yml"]
 
 
-def test_build_environment_secrets_requires_ssh_key():
+def test_build_environment_secrets_requires_ssh_key_for_key_auth():
     manager = GitHubActionsManager()
 
     try:
         manager.build_environment_secrets(
             {
+                "auth_mode": "ssh_key",
                 "host": "example.com",
                 "user": "deploy",
                 "deploy_path": "/srv/app",
@@ -42,6 +43,7 @@ def test_build_environment_secrets_maps_expected_values():
 
     secrets = manager.build_environment_secrets(
         {
+            "auth_mode": "ssh_key",
             "host": "example.com",
             "port": 2222,
             "user": "deploy",
@@ -59,6 +61,24 @@ def test_build_environment_secrets_maps_expected_values():
     assert secrets["AUTOMATRON_DEPLOY_SSH_PRIVATE_KEY"] == "PRIVATE KEY"
     assert secrets["AUTOMATRON_DEPLOY_ENV_FILE"] == "APP_ENV=prod"
     assert secrets["AUTOMATRON_APP_URL"] == "https://example.com"
+
+
+def test_build_environment_secrets_supports_password_auth():
+    manager = GitHubActionsManager()
+
+    secrets = manager.build_environment_secrets(
+        {
+            "auth_mode": "password",
+            "host": "example.com",
+            "port": 22,
+            "user": "root",
+            "deploy_path": "/srv/app",
+            "ssh_password": "super-secret",
+        }
+    )
+
+    assert secrets["AUTOMATRON_DEPLOY_SSH_PASSWORD"] == "super-secret"
+    assert "AUTOMATRON_DEPLOY_SSH_PRIVATE_KEY" not in secrets
 
 
 def test_encrypt_secret_returns_base64_ciphertext():

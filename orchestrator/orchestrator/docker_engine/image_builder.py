@@ -10,7 +10,8 @@ from docker.errors import DockerException
 
 logger = logging.getLogger(__name__)
 
-GOLDEN_IMAGE_DOCKERFILE = Path(__file__).parent.parent.parent.parent / "docker" / "golden-image"
+REPO_ROOT = Path(__file__).parent.parent.parent.parent
+GOLDEN_IMAGE_DOCKERFILE = REPO_ROOT / "docker" / "golden-image" / "Dockerfile"
 
 
 def build_golden_image(tag: str = "automatron/golden:latest") -> str:
@@ -28,7 +29,8 @@ def build_golden_image(tag: str = "automatron/golden:latest") -> str:
 
     try:
         image, build_logs = client.images.build(
-            path=str(GOLDEN_IMAGE_DOCKERFILE),
+            path=str(REPO_ROOT),
+            dockerfile=str(GOLDEN_IMAGE_DOCKERFILE.relative_to(REPO_ROOT)),
             tag=tag,
             rm=True,
             forcerm=True,

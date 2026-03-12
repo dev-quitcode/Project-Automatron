@@ -40,16 +40,23 @@ BuilderStatus = Literal["SUCCESS", "BLOCKER", "AMBIGUITY", "SILENT_DECISION", ""
 
 
 class DeployTarget(TypedDict, total=False):
+    auth_mode: str
     host: str
     port: int
     user: str
     deploy_path: str
     auth_reference: str
     ssh_private_key: str
+    ssh_password: str
     known_hosts: str
     env_content: str
     app_url: str
     health_path: str
+
+
+class LlmRoleConfig(TypedDict, total=False):
+    provider: str
+    model: str
 
 
 class AutomatronState(TypedDict, total=False):
@@ -62,6 +69,7 @@ class AutomatronState(TypedDict, total=False):
 
     plan_md: str
     stack_config: dict
+    llm_config: dict[str, LlmRoleConfig]
 
     current_task_index: int
     current_task_text: str

@@ -19,6 +19,7 @@ from orchestrator.api.websocket import (
 from orchestrator.config import settings
 from orchestrator.deployment.manager import DeploymentManager
 from orchestrator.graph.graph import compile_graph
+from orchestrator.llm.configuration import default_llm_config, normalize_llm_config
 from orchestrator.models.project import (
     get_project,
     record_approval,
@@ -44,7 +45,14 @@ manual_deployment_manager = DeploymentManager()
 def _get_graph():
     global _compiled_graph
     if _compiled_graph is None:
-        _compiled_graph = compile_graph()
+        raise RuntimeError("_get_graph() must not be used synchronously")
+    return _compiled_graph
+
+
+async def _aget_graph():
+    global _compiled_graph
+    if _compiled_graph is None:
+        _compiled_graph = await compile_graph()
     return _compiled_graph
 
 
@@ -205,8 +213,9 @@ async def _run_graph(
     *,
     initial_state: dict[str, Any] | None = None,
     resume_payload: dict[str, Any] | None = None,
+    resume_state_patch: dict[str, Any] | None = None,
 ) -> None:
-    graph = _get_graph()
+    graph = await _aget_graph()
     config = _make_thread_config(project_id)
     session_id = str(uuid.uuid4())
 
@@ -218,7 +227,10 @@ async def _run_graph(
             initial_state["session_id"] = session_id
             await graph.ainvoke(initial_state, config)
         else:
-            await graph.aupdate_state(config, {"session_id": session_id})
+            state_patch = {"session_id": session_id}
+            if resume_state_patch:
+                state_patch.update(resume_state_patch)
+            await graph.aupdate_state(config, state_patch)
             await graph.ainvoke(Command(resume=resume_payload or {"approved": True}), config)
 
         values = await _persist_and_emit(project_id, graph, config)
@@ -253,6 +265,55 @@ async def start_project(project_id: str) -> dict[str, str]:
     if not project:
         return {"status": "not_found", "project_id": project_id}
 
+    existing_checkpoints = await get_checkpoints(project_id)
+    should_resume_existing_run = (
+        bool(existing_checkpoints)
+        and (
+            project.get("status") in {"paused", "error"}
+            or project.get("project_stage") not in {"intake", "planning", "awaiting_plan_approval"}
+            or bool(project.get("plan_md"))
+            or bool(project.get("plan_approved"))
+            or bool(project.get("repo_ready"))
+            or bool(project.get("container_id"))
+        )
+    )
+
+    if should_resume_existing_run:
+        project_stage = _normalize_resume_stage(project)
+
+        await update_project_stage(project_id, project_stage)
+        await update_project_status(project_id, _status_from_stage(project_stage))
+        resume_state_patch = {
+            "plan_md": project.get("plan_md", ""),
+            "stack_config": project.get("stack_config", {}),
+            "llm_config": normalize_llm_config(project.get("llm_config") or default_llm_config()),
+            "deploy_target": project.get("deploy_target", {}),
+            "preview_url": project.get("preview_url") or "",
+            "preview_status": project.get("preview_status") or "pending",
+            "preview_metadata": project.get("preview_metadata", {}),
+            "plan_approved": bool(project.get("plan_approved", False)),
+            "preview_approved": bool(project.get("preview_approved", False)),
+            "repo_name": project.get("repo_name") or "",
+            "repo_url": project.get("repo_url") or "",
+            "repo_clone_url": project.get("repo_clone_url") or "",
+            "default_branch": project.get("default_branch") or "main",
+            "develop_branch": project.get("develop_branch") or "develop",
+            "feature_branch": project.get("feature_branch")
+            or repository_manager.create_feature_branch_name(project["name"]),
+            "repo_ready": bool(project.get("repo_ready", False)),
+            "container_id": project.get("container_id") or "",
+            "container_port": project.get("port") or 0,
+        }
+        task = asyncio.create_task(
+            _run_graph(
+                project_id,
+                resume_payload={"approved": True, "retry": True},
+                resume_state_patch=resume_state_patch,
+            )
+        )
+        _active_runs[project_id] = task
+        return {"status": "resumed", "project_id": project_id}
+
     initial_state: dict[str, Any] = {
         "project_id": project_id,
         "project_name": project["name"],
@@ -261,6 +322,7 @@ async def start_project(project_id: str) -> dict[str, str]:
         "source_ref": project.get("source_ref") or "",
         "plan_md": project.get("plan_md", ""),
         "stack_config": project.get("stack_config", {}),
+        "llm_config": normalize_llm_config(project.get("llm_config") or default_llm_config()),
         "current_task_index": 0,
         "current_task_text": "",
         "total_tasks": 0,
@@ -299,6 +361,28 @@ async def start_project(project_id: str) -> dict[str, str]:
     return {"status": "started", "project_id": project_id}
 
 
+def _normalize_resume_stage(project: dict[str, Any]) -> str:
+    project_stage = project.get("project_stage") or "planning"
+
+    if project.get("preview_approved"):
+        return "ready_for_deploy"
+    if project.get("preview_url"):
+        return "awaiting_preview_approval"
+    if project.get("container_id"):
+        return "building"
+    if project.get("repo_ready"):
+        return "repo_preparing"
+    if project.get("plan_approved"):
+        return "repo_preparing"
+    if project.get("plan_md"):
+        return "awaiting_plan_approval"
+
+    if project_stage in {"error", "intake"}:
+        return "planning"
+
+    return project_stage
+
+
 async def resume_project(
     project_id: str,
     *,
@@ -314,7 +398,34 @@ async def resume_project(
 
     await record_approval(project_id, approval_type, True, feedback=feedback)
     payload = {"approved": True, "feedback": feedback, "approval_type": approval_type}
-    task = asyncio.create_task(_run_graph(project_id, resume_payload=payload))
+    resume_state_patch = {
+        "plan_md": project.get("plan_md", ""),
+        "stack_config": project.get("stack_config", {}),
+        "llm_config": normalize_llm_config(project.get("llm_config") or default_llm_config()),
+        "deploy_target": project.get("deploy_target", {}),
+        "preview_url": project.get("preview_url") or "",
+        "preview_status": project.get("preview_status") or "pending",
+        "preview_metadata": project.get("preview_metadata", {}),
+        "plan_approved": bool(project.get("plan_approved", False)),
+        "preview_approved": bool(project.get("preview_approved", False)),
+        "repo_name": project.get("repo_name") or "",
+        "repo_url": project.get("repo_url") or "",
+        "repo_clone_url": project.get("repo_clone_url") or "",
+        "default_branch": project.get("default_branch") or "main",
+        "develop_branch": project.get("develop_branch") or "develop",
+        "feature_branch": project.get("feature_branch")
+        or repository_manager.create_feature_branch_name(project["name"]),
+        "repo_ready": bool(project.get("repo_ready", False)),
+        "container_id": project.get("container_id") or "",
+        "container_port": project.get("port") or 0,
+    }
+    task = asyncio.create_task(
+        _run_graph(
+            project_id,
+            resume_payload=payload,
+            resume_state_patch=resume_state_patch,
+        )
+    )
     _active_runs[project_id] = task
     return {"status": "resumed", "project_id": project_id, "approval_type": approval_type}
 
@@ -375,6 +486,10 @@ async def stop_project(project_id: str) -> dict[str, str]:
         task.cancel()
         await update_project_status(project_id, "paused")
         return {"status": "stopped", "project_id": project_id}
+    project = await get_project(project_id)
+    if project and project.get("status") in {"planning", "building", "preview"}:
+        await update_project_status(project_id, "paused")
+        return {"status": "paused", "project_id": project_id}
     return {"status": "not_running", "project_id": project_id}
 
 
@@ -383,7 +498,7 @@ def is_running(project_id: str) -> bool:
 
 
 async def get_checkpoints(project_id: str) -> list[dict[str, Any]]:
-    graph = _get_graph()
+    graph = await _aget_graph()
     config = _make_thread_config(project_id)
 
     checkpoints: list[dict[str, Any]] = []

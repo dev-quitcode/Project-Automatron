@@ -45,9 +45,20 @@ RUN npm install -g pnpm
 RUN npm install -g cline
 
 # ── Create non-privileged user ──────────────────────────────
-RUN useradd -m -s /bin/bash -u 1000 developer \
-    && mkdir -p /workspace \
-    && chown -R developer:developer /workspace
+RUN if getent passwd 1000 >/dev/null; then \
+        existing_user="$(getent passwd 1000 | cut -d: -f1)"; \
+        if [ "$existing_user" != "developer" ]; then \
+            usermod -l developer "$existing_user"; \
+            usermod -d /home/developer -m developer || true; \
+        fi; \
+    else \
+        useradd -m -s /bin/bash -u 1000 developer; \
+    fi \
+    && mkdir -p /workspace /home/developer \
+    && chown -R 1000:1000 /workspace /home/developer
+
+ENV HOME=/home/developer
+ENV XDG_CONFIG_HOME=/home/developer/.config
 
 # ── Copy scaffold scripts ──────────────────────────────────
 COPY orchestrator/scripts/ /opt/automatron/scripts/

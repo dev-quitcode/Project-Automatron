@@ -14,7 +14,7 @@ dev-ui: ## Run Next.js in dev mode
 
 # ── Docker ─────────────────────────────────────────────────
 golden: ## Build the Golden Image
-	docker build -t automatron/golden:latest -f docker/golden-image/Dockerfile docker/golden-image/
+	docker build -t automatron/golden:latest -f docker/golden-image/Dockerfile .
 
 build: ## Build all Docker images
 	docker compose build

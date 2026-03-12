@@ -29,7 +29,22 @@ export interface StackConfig {
   [key: string]: unknown;
 }
 
+export type LlmProvider = "openai" | "anthropic" | "google";
+export type DeployAuthMode = "ssh_key" | "password";
+
+export interface LlmRoleConfig {
+  provider: LlmProvider;
+  model: string;
+}
+
+export interface ProjectLlmConfig {
+  architect: LlmRoleConfig;
+  builder: LlmRoleConfig;
+  reviewer: LlmRoleConfig;
+}
+
 export interface DeployTargetSummary {
+  auth_mode: DeployAuthMode | null;
   host: string | null;
   port: number | null;
   user: string | null;
@@ -50,6 +65,7 @@ export interface Project {
   project_stage: ProjectStage;
   plan_md: string | null;
   stack_config: StackConfig;
+  llm_config: ProjectLlmConfig;
   repo_name: string | null;
   repo_url: string | null;
   repo_clone_url: string | null;
@@ -164,15 +180,34 @@ export interface ProjectCreateRequest {
   intake_text: string;
   source?: string;
   source_ref?: string | null;
+  llm_config?: ProjectLlmConfig;
+}
+
+export interface UpdateProjectLlmConfigRequest extends ProjectLlmConfig {}
+
+export interface LlmCatalogEntry {
+  id: string;
+  label: string;
+}
+
+export interface ProviderModelCatalog {
+  provider: LlmProvider;
+  configured: boolean;
+  models: LlmCatalogEntry[];
+  fetched_at: string | null;
+  error: string | null;
+  cached: boolean;
 }
 
 export interface DeployTargetRequest {
+  auth_mode: DeployAuthMode;
   host: string;
   port?: number;
   user: string;
   deploy_path: string;
   auth_reference?: string;
-  ssh_private_key: string;
+  ssh_private_key?: string;
+  ssh_password?: string;
   known_hosts?: string;
   env_content?: string;
   app_url?: string;

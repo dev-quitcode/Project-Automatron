@@ -12,10 +12,10 @@ logger = logging.getLogger(__name__)
 MAX_ESCALATIONS = 2
 
 
-def route_after_plan_review(state: AutomatronState) -> Literal["repo_prepare", "architect"]:
+def route_after_plan_review(state: AutomatronState) -> Literal["repo_prepare", "task_selector"]:
     if state.get("container_id"):
-        logger.info("Plan review resume after freeze -> architect")
-        return "architect"
+        logger.info("Plan review approved for existing workspace -> task_selector")
+        return "task_selector"
     logger.info("Initial plan review approved -> repo_prepare")
     return "repo_prepare"
 

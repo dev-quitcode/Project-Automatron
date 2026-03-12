@@ -270,7 +270,8 @@ class RepositoryManager:
                 f"# Deploy {project_name}\n\n"
                 "This project is deployed by GitHub Actions using the `production` environment.\n"
                 "The release workflow uploads the repository to the VPS and runs "
-                "`docker compose -f deploy/docker-compose.yml up -d --build`.\n"
+                "`docker compose -f deploy/docker-compose.yml up -d --build`.\n\n"
+                "Recommended application health check path: `/api/health`.\n"
             ),
             encoding="utf-8",
         )

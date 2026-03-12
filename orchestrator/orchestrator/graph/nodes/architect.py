@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from orchestrator.api.websocket import emit_architect_message, emit_plan_updated
 from orchestrator.graph.state import AutomatronState
+from orchestrator.llm.configuration import default_llm_config, normalize_llm_config
 from orchestrator.llm.prompts import load_prompt
 from orchestrator.llm.provider import call_llm
 from orchestrator.models.project import save_chat_message
@@ -24,6 +25,8 @@ async def architect_node(state: AutomatronState) -> dict:
     plan_md = state.get("plan_md", "")
     builder_status = state.get("builder_status", "")
     builder_error = state.get("builder_error_detail", "")
+    llm_config = normalize_llm_config(state.get("llm_config") or default_llm_config())
+    architect_model = llm_config["architect"]["model"]
     is_escalation = builder_status in ("BLOCKER", "AMBIGUITY") and bool(plan_md)
 
     if is_escalation:
@@ -47,24 +50,50 @@ async def architect_node(state: AutomatronState) -> dict:
     else:
         system_prompt = load_prompt("architect", "v1")
         intake_text = state.get("intake_text", "")
-        messages = [SystemMessage(content=system_prompt)] + list(state.get("messages", []))
+        messages = [
+            SystemMessage(
+                content=(
+                    f"{system_prompt}\n\n"
+                    "You must not stop at clarifying questions. "
+                    "If requirements are ambiguous, choose sensible MVP defaults and still return "
+                    "a complete PLAN.md and STACK_CONFIG.json."
+                )
+            )
+        ] + list(state.get("messages", []))
         if not any(isinstance(message, HumanMessage) for message in messages):
             messages.append(HumanMessage(content=intake_text))
 
-    response_text = await call_llm(messages)
+    response_text = await call_llm(messages, model=architect_model)
     new_plan_md = _extract_plan_md(response_text)
     stack_config = _extract_stack_config(response_text)
+    if not new_plan_md:
+        response_text, new_plan_md, stack_config = await _repair_architect_output(
+            response_text=response_text,
+            intake_text=state.get("intake_text", ""),
+            plan_md=plan_md,
+            stack_config=stack_config,
+            architect_model=architect_model,
+        )
 
     await save_chat_message(str(uuid.uuid4()), project_id, "architect", response_text)
     await emit_architect_message(project_id, response_text, streaming=False)
 
-    result: dict = {
-        "messages": [AIMessage(content=response_text)],
-        "project_stage": "awaiting_plan_approval",
-        "status": "planning",
-        "requires_human": True,
-        "human_intervention_reason": "Review and approve the generated technical plan.",
-    }
+    if is_escalation:
+        result: dict = {
+            "messages": [AIMessage(content=response_text)],
+            "project_stage": "building",
+            "status": "building",
+            "requires_human": False,
+            "human_intervention_reason": "",
+        }
+    else:
+        result = {
+            "messages": [AIMessage(content=response_text)],
+            "project_stage": "awaiting_plan_approval",
+            "status": "planning",
+            "requires_human": True,
+            "human_intervention_reason": "Review and approve the generated technical plan.",
+        }
 
     if new_plan_md:
         result["plan_md"] = new_plan_md
@@ -76,6 +105,38 @@ async def architect_node(state: AutomatronState) -> dict:
 
     logger.info("Architect generated plan for %s (%d chars)", project_name, len(new_plan_md or ""))
     return result
+
+
+async def _repair_architect_output(
+    *,
+    response_text: str,
+    intake_text: str,
+    plan_md: str,
+    stack_config: dict | None,
+    architect_model: str,
+) -> tuple[str, str | None, dict | None]:
+    repair_prompt = (
+        "Convert the material below into a valid Automatron planning response.\n"
+        "Return ONLY:\n"
+        "1. A full PLAN.md inside a ```markdown block\n"
+        "2. A STACK_CONFIG.json inside a ```json block\n"
+        "Do not ask clarifying questions. If details are missing, choose sensible MVP defaults.\n\n"
+        f"Raw intake:\n{intake_text}\n\n"
+        f"Previous response:\n{response_text}\n\n"
+        f"Existing PLAN.md:\n{plan_md}\n"
+    )
+    repair_response = await call_llm(
+        [
+            SystemMessage(content="You repair architect outputs into valid PLAN.md and STACK_CONFIG.json."),
+            HumanMessage(content=repair_prompt),
+        ],
+        model=architect_model,
+    )
+    repaired_plan_md = _extract_plan_md(repair_response)
+    repaired_stack_config = _extract_stack_config(repair_response) or stack_config
+    if repaired_plan_md:
+        return repair_response, repaired_plan_md, repaired_stack_config
+    return response_text, plan_md or None, stack_config
 
 
 def _extract_plan_md(response: str) -> str | None:
